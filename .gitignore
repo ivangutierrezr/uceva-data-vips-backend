@@ -1,0 +1,78 @@
+# =========================================
+# Python / Django
+# =========================================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Django runtime files
+db.sqlite3
+db.sqlite3-journal
+*.log
+logs/
+media/
+staticfiles/
+
+# =========================================
+# Virtual environments
+# =========================================
+.venv/
+venv/
+env/
+ENV/
+
+# =========================================
+# Environment variables / secrets
+# =========================================
+.env
+.env.*
+!.env.example
+
+# =========================================
+# Testing / coverage
+# =========================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# =========================================
+# Build / packaging
+# =========================================
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# =========================================
+# Node tooling (used by package.json in backend)
+# =========================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================================
+# IDE / Editor
+# =========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================================
+# OS files
+# =========================================
+.DS_Store
+Thumbs.db
+
+# =========================================
+# Local temp files
+# =========================================
+tmp/
+temp/
+*.tmp
