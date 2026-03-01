@@ -118,12 +118,3 @@ def analyze_duplicates() -> list[str]:
     return reports
 
 
-def main() -> None:
-    from .django_setup import setup_django
-
-    setup_django()
-    analyze_duplicates()
-
-
-if __name__ == "__main__":
-    main()

@@ -5,7 +5,7 @@ from typing import Iterable
 
 from django.db import connection
 
-from .csv_io import write_csv
+from scienti.infrastructure.files.csv_io import write_csv
 
 
 @dataclass(frozen=True)
@@ -234,14 +234,6 @@ def get_default_exports() -> list[SqlExport]:
     ]
 
 
-def main() -> None:
-    from .django_setup import setup_django
-
-    setup_django()
-
+def export_views() -> None:
     for export in get_default_exports():
         export_sql_to_csv(export.query, export.filename)
-
-
-if __name__ == "__main__":
-    main()

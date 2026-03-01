@@ -154,12 +154,3 @@ def export_all_data() -> None:
             )
 
 
-def main() -> None:
-    from .django_setup import setup_django
-
-    setup_django()
-    export_all_data()
-
-
-if __name__ == "__main__":
-    main()

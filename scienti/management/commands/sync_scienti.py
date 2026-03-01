@@ -21,17 +21,66 @@ import time
 class Command(BaseCommand):
     help = 'Sincroniza los datos de grupos de investigación desde Scienti (Minciencias)'
 
-    def handle(self, *args, **options):
-        self.stdout.write(self.style.SUCCESS('Iniciando proceso de sincronización con Scienti...'))
-        scraper = ScientiScraper(self.stdout, self.style)
-        scraper.run()
-        self.stdout.write(self.style.SUCCESS('Sincronización de grupos completada.'))
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--dry-run',
+            action='store_true',
+            help='Ejecuta todo el proceso de extraccion simulando la insercion para reportar cuantas filas se crearian, pero revierte todo al final (no guarda en base de datos).',
+        )
 
-        # Call Enrich Researchers Command
+    def handle(self, *args, **options):
+        from django.apps import apps
         from django.core.management import call_command
-        self.stdout.write(self.style.WARNING('Iniciando enriquecimiento de investigadores...'))
-        call_command('enrich_researchers')
-        self.stdout.write(self.style.SUCCESS('Enriquecimiento completado exitosamente.'))
+        from django.db import transaction
+        
+        is_dry_run = options.get('dry_run')
+        app_models = apps.get_app_config('scienti').get_models()
+        
+        initial_counts = {}
+        if is_dry_run:
+            self.stdout.write(self.style.WARNING("=================================================="))
+            self.stdout.write(self.style.WARNING("====== MODO DRY RUN ACTIVO (SIMULACION) ========"))
+            self.stdout.write(self.style.WARNING("=================================================="))
+            self.stdout.write(self.style.NOTICE("Calculando estado base de las tablas..."))
+            for model in app_models:
+                initial_counts[model.__name__] = model.objects.count()
+        
+        try:
+            with transaction.atomic():
+                self.stdout.write(self.style.SUCCESS('Iniciando proceso de sincronizacion con Scienti...'))
+                scraper = ScientiScraper(self.stdout, self.style)
+                scraper.run()
+                self.stdout.write(self.style.SUCCESS('Sincronizacion de grupos completada.'))
+
+                # Call Enrich Researchers Command
+                self.stdout.write(self.style.WARNING('Iniciando enriquecimiento de investigadores...'))
+                call_command('enrich_researchers')
+                self.stdout.write(self.style.SUCCESS('Enriquecimiento completado exitosamente.'))
+                
+                if is_dry_run:
+                    self.stdout.write(self.style.WARNING("\n================ REPORTE DE VOLUMEN (DRY-RUN) ================"))
+
+                    changes_found = False
+                    for model in app_models:
+                        final_count = model.objects.count()
+                        initial = initial_counts[model.__name__]
+                        diff = final_count - initial
+                        if diff > 0:
+                            self.stdout.write(self.style.SUCCESS(f"{model.__name__:<25} | Antes: {initial:<8} | Despues: {final_count:<8} | Insertados (Diff): +{diff:<8}"))
+                            changes_found = True
+                    
+                    if not changes_found:
+                        self.stdout.write(self.style.NOTICE("Ninguna tabla recibiria registros nuevos."))
+                    
+                    self.stdout.write(self.style.WARNING("=============================================================="))
+                    
+                    self.stdout.write(self.style.ERROR("REVIRTIENDO TRANSACCION PARA NO MODIFICAR BD..."))
+                    transaction.set_rollback(True)
+                    self.stdout.write(self.style.SUCCESS("Rollback completado. La base de datos sigue intacta."))
+                    
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f"Error durante el proceso: {e}"))
+            raise e
 
 class ScientiScraper:
     BASE_URL = "https://scienti.minciencias.gov.co/ciencia-war/busquedaGrupoXInstitucionGrupos.do"

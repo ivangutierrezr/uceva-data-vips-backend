@@ -4,7 +4,7 @@ from django.db import models
 from django.db.models import Count, Q
 from django.db.models.functions import ExtractYear
 from .models import Researcher, Article, Thesis, Book, BookChapter, Country, ResearchGroup, ScientificEvent, ResearchLine
-from .utils.country_coords import COUNTRY_COORDINATES
+from .infrastructure.utils.country_coords import COUNTRY_COORDINATES
 import unicodedata
 
 def remove_accents(input_str):
@@ -338,5 +338,6 @@ def get_country_details(request, country_id):
         "recentArticles": _r_articles,
         "recentBooks": _r_books
     })
+
 
 
