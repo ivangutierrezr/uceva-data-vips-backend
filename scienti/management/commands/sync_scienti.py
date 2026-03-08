@@ -17,6 +17,7 @@ import re
 import hashlib
 import unicodedata
 import time
+from difflib import SequenceMatcher
 
 class Command(BaseCommand):
     help = 'Sincroniza los datos de grupos de investigación desde Scienti (Minciencias)'
@@ -52,10 +53,39 @@ class Command(BaseCommand):
                 scraper.run()
                 self.stdout.write(self.style.SUCCESS('Sincronizacion de grupos completada.'))
 
-                # Call Enrich Researchers Command
-                self.stdout.write(self.style.WARNING('Iniciando enriquecimiento de investigadores...'))
+                self.stdout.write(self.style.WARNING('Iniciando post-proceso secuencial (full)...'))
+
+                # 1) Enrich researcher profile fields from external source.
+                self.stdout.write(self.style.WARNING('1/5 Enriquecimiento de investigadores...'))
                 call_command('enrich_researchers')
-                self.stdout.write(self.style.SUCCESS('Enriquecimiento completado exitosamente.'))
+                self.stdout.write(self.style.SUCCESS('1/5 Enriquecimiento de investigadores completado.'))
+
+                # 2) Enrich article categories using SCIMAGO/PUBLINDEX datasets.
+                self.stdout.write(self.style.WARNING('2/5 Enriquecimiento de categorias de articulos...'))
+                call_command('enrich_articles')
+                self.stdout.write(self.style.SUCCESS('2/5 Enriquecimiento de articulos completado.'))
+
+                # 3) Remove duplicate articles created during aggregation/scraping.
+                self.stdout.write(self.style.WARNING('3/5 Limpieza de duplicados de articulos...'))
+                if is_dry_run:
+                    call_command('cleanup_article_duplicates')
+                else:
+                    call_command('cleanup_article_duplicates', apply=True)
+                self.stdout.write(self.style.SUCCESS('3/5 Limpieza de articulos completada.'))
+
+                # 4) Remove duplicate books/chapters created during aggregation/scraping.
+                self.stdout.write(self.style.WARNING('4/5 Limpieza de duplicados de libros y capitulos...'))
+                if is_dry_run:
+                    call_command('cleanup_books_chapters_duplicates')
+                else:
+                    call_command('cleanup_books_chapters_duplicates', apply=True)
+                self.stdout.write(self.style.SUCCESS('4/5 Limpieza de libros/capitulos completada.'))
+
+                # 5) Final verification report for duplicated records.
+                self.stdout.write(self.style.WARNING('5/5 Verificacion final de duplicados...'))
+                call_command('analyze_duplicates')
+                self.stdout.write(self.style.SUCCESS('5/5 Verificacion final completada.'))
+                self.stdout.write(self.style.SUCCESS('Post-proceso secuencial finalizado.'))
                 
                 if is_dry_run:
                     self.stdout.write(self.style.WARNING("\n================ REPORTE DE VOLUMEN (DRY-RUN) ================"))
@@ -127,6 +157,154 @@ class ScientiScraper:
         cleaned_text = cleaned_text.upper().strip()
         cleaned_text = re.sub(r'[^A-Z0-9]', '', cleaned_text)
         return cleaned_text
+
+    def _normalize_text_for_similarity(self, text: str) -> str:
+        if not text:
+            return ""
+        normalized = unicodedata.normalize('NFD', text)
+        no_accents = ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')
+        lowered = no_accents.lower()
+        lowered = re.sub(r'[^a-z0-9\s]', ' ', lowered)
+        lowered = re.sub(r'\s+', ' ', lowered).strip()
+        return lowered
+
+    def _similarity_ratio(self, a: str, b: str) -> float:
+        na = self._normalize_text_for_similarity(a)
+        nb = self._normalize_text_for_similarity(b)
+        if not na or not nb:
+            return 0.0
+        return SequenceMatcher(None, na, nb).ratio()
+
+    def _pick_better_book_record(self, current: dict, candidate: dict) -> dict:
+        def to_year(value):
+            try:
+                return int(value)
+            except Exception:
+                return 0
+
+        cy = to_year(current.get('year'))
+        ny = to_year(candidate.get('year'))
+        if ny > cy:
+            return candidate
+        if cy > ny:
+            return current
+
+        current_title_len = len(self._normalize_text_for_similarity(current.get('title', '')))
+        candidate_title_len = len(self._normalize_text_for_similarity(candidate.get('title', '')))
+        if candidate_title_len > current_title_len:
+            return candidate
+        if current_title_len > candidate_title_len:
+            return current
+
+        current_score = 0
+        candidate_score = 0
+        for field in ['isbn', 'publisher', 'country']:
+            if current.get(field):
+                current_score += 1
+            if candidate.get(field):
+                candidate_score += 1
+        current_score += len(current.get('autores', []))
+        candidate_score += len(candidate.get('autores', []))
+
+        if candidate_score > current_score:
+            return candidate
+        return current
+
+    def _pick_better_chapter_record(self, current: dict, candidate: dict) -> dict:
+        def to_year(value):
+            try:
+                return int(value)
+            except Exception:
+                return 0
+
+        cy = to_year(current.get('year'))
+        ny = to_year(candidate.get('year'))
+        if ny > cy:
+            return candidate
+        if cy > ny:
+            return current
+
+        current_len = len(self._normalize_text_for_similarity(current.get('chapter_title', ''))) + len(self._normalize_text_for_similarity(current.get('book_title', '')))
+        candidate_len = len(self._normalize_text_for_similarity(candidate.get('chapter_title', ''))) + len(self._normalize_text_for_similarity(candidate.get('book_title', '')))
+        if candidate_len > current_len:
+            return candidate
+        if current_len > candidate_len:
+            return current
+
+        current_score = 0
+        candidate_score = 0
+        for field in ['isbn', 'publisher']:
+            if current.get(field):
+                current_score += 1
+            if candidate.get(field):
+                candidate_score += 1
+        current_score += len(current.get('autores', []))
+        candidate_score += len(candidate.get('autores', []))
+
+        if candidate_score > current_score:
+            return candidate
+        return current
+
+    def _merge_authors(self, base: dict, incoming: dict):
+        base_authors = list(base.get('autores', []))
+        for name in incoming.get('autores', []):
+            if name not in base_authors:
+                base_authors.append(name)
+        base['autores'] = base_authors
+
+    def _dedupe_books_rows(self, books: list[dict]) -> list[dict]:
+        survivors = []
+        for candidate in books:
+            duplicate_index = None
+            for idx, current in enumerate(survivors):
+                same_isbn = bool(candidate.get('isbn')) and bool(current.get('isbn')) and self._normalize_key(candidate.get('isbn')) == self._normalize_key(current.get('isbn'))
+                title_similarity = self._similarity_ratio(candidate.get('title', ''), current.get('title', ''))
+                same_country = self._normalize_key(candidate.get('country', '')) == self._normalize_key(current.get('country', ''))
+
+                if same_isbn or (title_similarity >= 0.95 and same_country):
+                    duplicate_index = idx
+                    break
+
+            if duplicate_index is None:
+                survivors.append(candidate)
+                continue
+
+            current = survivors[duplicate_index]
+            better = self._pick_better_book_record(current, candidate)
+            if better is candidate:
+                self._merge_authors(candidate, current)
+                survivors[duplicate_index] = candidate
+            else:
+                self._merge_authors(current, candidate)
+
+        return survivors
+
+    def _dedupe_chapters_rows(self, chapters: list[dict]) -> list[dict]:
+        survivors = []
+        for candidate in chapters:
+            duplicate_index = None
+            for idx, current in enumerate(survivors):
+                same_isbn = bool(candidate.get('isbn')) and bool(current.get('isbn')) and self._normalize_key(candidate.get('isbn')) == self._normalize_key(current.get('isbn'))
+                chapter_similarity = self._similarity_ratio(candidate.get('chapter_title', ''), current.get('chapter_title', ''))
+                book_similarity = self._similarity_ratio(candidate.get('book_title', ''), current.get('book_title', ''))
+
+                if same_isbn or (chapter_similarity >= 0.95 and book_similarity >= 0.90):
+                    duplicate_index = idx
+                    break
+
+            if duplicate_index is None:
+                survivors.append(candidate)
+                continue
+
+            current = survivors[duplicate_index]
+            better = self._pick_better_chapter_record(current, candidate)
+            if better is candidate:
+                self._merge_authors(candidate, current)
+                survivors[duplicate_index] = candidate
+            else:
+                self._merge_authors(current, candidate)
+
+        return survivors
 
     def _parse_location_string(self, text: str):
         """
@@ -1078,6 +1256,7 @@ class ScientiScraper:
     # --- EXTRACTORS ---
     def _extract_articles_from_soup(self, soup):
         articles = []
+        seen_by_canonical_key = {}
         headers = soup.find_all('td', class_='celdaEncabezado')
         target_header = None
         for h in headers:
@@ -1196,12 +1375,20 @@ class ScientiScraper:
                             revista = pre_issn_part
 
                 # Year
-                # Look for 4 digits bounded by word boundaries
+                # Prefer year that appears after ISSN and avoid taking ISSN prefix as year.
                 if not anio:
-                    m_anio = re.search(r'\b(19|20)\d{2}\b', line)
-                    if m_anio:
-                         # Ensure it's not part of ISSN or DOI if possible, but regex \b helps
-                         anio = m_anio.group(0)
+                    m_anio_after_issn = re.search(
+                        r'ISSN\s*:\s*[0-9]{4}-[0-9]{3}[0-9X]\s*,?\s*((?:19|20)\d{2})\b',
+                        line,
+                        re.IGNORECASE,
+                    )
+                    if m_anio_after_issn:
+                        anio = m_anio_after_issn.group(1)
+                    else:
+                        # Fallback: avoid matching numbers that are part of patterns like 1909-0528.
+                        m_anio = re.search(r'\b(?:19|20)\d{2}\b(?!-\d)', line)
+                        if m_anio:
+                            anio = m_anio.group(0)
 
                 # DOI
                 if "DOI:" in line and not doi:
@@ -1234,7 +1421,7 @@ class ScientiScraper:
                     m_pags = re.search(r'(?:p[áa]gs?\.?|pp?\.?)\s*:?\s*([\d\s\-]+)', line, re.IGNORECASE)
                     if m_pags: paginas = m_pags.group(1).strip()
 
-            articles.append({
+            article_row = {
                 "product_type": self._to_title_case(subtipo_producto),
                 "title": self._to_title_case(titulo),
                 "country": self._to_title_case(pais),
@@ -1247,7 +1434,42 @@ class ScientiScraper:
                 "doi": doi,
                 "doi_suffix": sufijo_doi,
                 "autores": autores
-            })
+            }
+
+            # Canonical key to avoid duplicated rows with small metadata noise (e.g., conflicting ISSN).
+            # We intentionally exclude ISSN from the key and preserve the first occurrence in source order.
+            canonical_key = "|".join([
+                self._normalize_key(article_row.get("product_type", "")),
+                self._normalize_key(article_row.get("title", "")),
+                str(article_row.get("year", "") or ""),
+                self._normalize_key(article_row.get("journal", "")),
+                self._normalize_key(article_row.get("country", "")),
+                self._normalize_key(article_row.get("volume", "")),
+                self._normalize_key(article_row.get("fasciculo", "")),
+                self._normalize_key(article_row.get("paginas", "")),
+            ])
+
+            if canonical_key in seen_by_canonical_key:
+                existing = seen_by_canonical_key[canonical_key]
+
+                # Keep first row as canonical; enrich only if canonical is missing data.
+                if not existing.get("issn") and article_row.get("issn"):
+                    existing["issn"] = article_row["issn"]
+                if not existing.get("doi") and article_row.get("doi"):
+                    existing["doi"] = article_row["doi"]
+                    existing["doi_suffix"] = article_row.get("doi_suffix", "")
+
+                if article_row.get("autores"):
+                    merged_authors = list(existing.get("autores", []))
+                    for author_name in article_row["autores"]:
+                        if author_name not in merged_authors:
+                            merged_authors.append(author_name)
+                    existing["autores"] = merged_authors
+                continue
+
+            seen_by_canonical_key[canonical_key] = article_row
+
+        articles = list(seen_by_canonical_key.values())
         return articles
 
     def _extract_books_from_soup(self, soup):
@@ -1379,7 +1601,7 @@ class ScientiScraper:
                     "publisher": self._to_title_case(editorial),
                     "country": self._to_title_case(pais)
                 })
-        return books
+        return self._dedupe_books_rows(books)
 
     def _extract_chapters_from_soup(self, soup):
         chapters = []
@@ -1462,7 +1684,7 @@ class ScientiScraper:
                     "isbn": isbn,
                     "publisher": self._to_title_case(editorial)
                 })
-        return chapters
+        return self._dedupe_chapters_rows(chapters)
 
     def _extract_thesis_from_soup(self, soup):
         theses = []

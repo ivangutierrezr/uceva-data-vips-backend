@@ -1,10 +1,34 @@
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
+from django.http import HttpResponse
 from django.db import models
-from django.db.models import Count, Q
+from django.db.models import Count, Q, F, Value
 from django.db.models.functions import ExtractYear
-from .models import Researcher, Article, Thesis, Book, BookChapter, Country, ResearchGroup, ScientificEvent, ResearchLine
+from django.db.models.functions import Coalesce, Lower
+from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from django.utils import timezone
+from .models import (
+    Researcher,
+    Article,
+    ArticleCategory,
+    Thesis,
+    Book,
+    BookChapter,
+    Country,
+    ResearchGroup,
+    ScientificEvent,
+    ResearchLine,
+    ArticleAuthor,
+    BookAuthor,
+    ChapterAuthor,
+    ThesisTutor,
+    ThesisStudent,
+)
 from .infrastructure.utils.country_coords import COUNTRY_COORDINATES
+import re
 import unicodedata
 
 def remove_accents(input_str):
@@ -12,6 +36,1313 @@ def remove_accents(input_str):
     nfkd_form = unicodedata.normalize('NFKD', input_str)
     return "".join([c for c in nfkd_form if not unicodedata.category(c).startswith('Mn')])
 
+
+def normalize_identifier(value):
+    if not value:
+        return ""
+    return re.sub(r'[^a-z0-9]', '', remove_accents(value).lower())
+
+
+def normalize_doi(value):
+    if not value:
+        return ""
+    return normalize_identifier(value)
+
+
+ACCENTED_CHARS = 'áàäâãéèëêíìïîóòöôõúùüûñç'
+PLAIN_CHARS = 'aaaaaeeeeiiiiooooouuuunc'
+
+
+def normalized_text_annotation(field_name):
+    """Builds a lowercase accent-insensitive SQL expression for text search."""
+    return Lower(
+        models.Func(
+            Lower(Coalesce(F(field_name), Value(''), output_field=models.TextField())),
+            Value(ACCENTED_CHARS),
+            Value(PLAIN_CHARS),
+            function='TRANSLATE',
+            output_field=models.TextField(),
+        )
+    )
+
+
+def unique_by_id(items):
+    """Deduplicates response rows preserving original order."""
+    seen = set()
+    unique_items = []
+    for item in items:
+        item_id = item.get('id')
+        if item_id in seen:
+            continue
+        seen.add(item_id)
+        unique_items.append(item)
+    return unique_items
+
+
+def _normalize_text_key(value):
+    return normalize_identifier(str(value or ''))
+
+
+def _append_unique_thesis_row(target_rows, row, related_field):
+    key = (
+        _normalize_text_key(row.get('title')),
+        row.get('year') or None,
+        _normalize_text_key(row.get('thesisType')),
+        _normalize_text_key(row.get('institution')),
+    )
+
+    for existing in target_rows:
+        existing_key = (
+            _normalize_text_key(existing.get('title')),
+            existing.get('year') or None,
+            _normalize_text_key(existing.get('thesisType')),
+            _normalize_text_key(existing.get('institution')),
+        )
+        if existing_key == key:
+            merged = list(dict.fromkeys((existing.get(related_field) or []) + (row.get(related_field) or [])))
+            existing[related_field] = merged
+            return
+
+    row[related_field] = list(dict.fromkeys(row.get(related_field) or []))
+    target_rows.append(row)
+
+
+def identifier_annotation(field_name):
+    # Normalizes DOI/ISSN/ISBN in DB (remove non-alphanumeric chars).
+    return Lower(
+        models.Func(
+            Coalesce(F(field_name), Value(''), output_field=models.TextField()),
+            Value('[^a-zA-Z0-9]'),
+            Value(''),
+            Value('g'),
+            function='REGEXP_REPLACE',
+            output_field=models.TextField(),
+        )
+    )
+
+
+@api_view(['GET'])
+def global_search(request):
+    query = (request.query_params.get('q') or "").strip()
+    if not query:
+        return Response(
+            {"error": "Query parameter 'q' is required."},
+            status=400,
+        )
+
+    per_type_limit = request.query_params.get('limit', '10')
+    try:
+        per_type_limit = max(1, min(int(per_type_limit), 50))
+    except ValueError:
+        per_type_limit = 10
+
+    query_identifier = normalize_identifier(query)
+    query_doi = normalize_doi(query)
+    query_normalized = remove_accents(query).lower()
+
+    article_ids_by_author = ArticleAuthor.objects.annotate(
+        normalized_author_name=normalized_text_annotation('author_name'),
+        normalized_researcher_name=normalized_text_annotation('researcher__name'),
+    ).filter(
+        Q(normalized_author_name__icontains=query_normalized) |
+        Q(normalized_researcher_name__icontains=query_normalized)
+    ).values_list('article_id', flat=True)
+
+    book_ids_by_author = BookAuthor.objects.annotate(
+        normalized_author_name=normalized_text_annotation('author_name'),
+        normalized_researcher_name=normalized_text_annotation('researcher__name'),
+    ).filter(
+        Q(normalized_author_name__icontains=query_normalized) |
+        Q(normalized_researcher_name__icontains=query_normalized)
+    ).values_list('book_id', flat=True)
+
+    chapter_ids_by_author = ChapterAuthor.objects.annotate(
+        normalized_author_name=normalized_text_annotation('author_name'),
+        normalized_researcher_name=normalized_text_annotation('researcher__name'),
+    ).filter(
+        Q(normalized_author_name__icontains=query_normalized) |
+        Q(normalized_researcher_name__icontains=query_normalized)
+    ).values_list('chapter_id', flat=True)
+
+    researchers_qs = (
+        Researcher.objects.annotate(
+            normalized_name=normalized_text_annotation('name'),
+        )
+        .filter(
+            Q(normalized_name__icontains=query_normalized) |
+            Q(name__icontains=query) |
+            Q(code_rh__icontains=query)
+        )
+        .order_by('name')[:per_type_limit]
+    )
+
+    groups_qs = (
+        ResearchGroup.objects.annotate(
+            normalized_name=normalized_text_annotation('name'),
+        )
+        .filter(
+            Q(normalized_name__icontains=query_normalized) |
+            Q(name__icontains=query) |
+            Q(code__icontains=query) |
+            Q(leader__icontains=query)
+        )
+        .order_by('name')[:per_type_limit]
+    )
+
+    articles_qs = (
+        Article.objects.select_related('journal', 'group')
+        .annotate(
+            normalized_issn=identifier_annotation('issn'),
+            normalized_journal_issn=identifier_annotation('journal__issn'),
+            normalized_doi=identifier_annotation('doi'),
+            normalized_title=normalized_text_annotation('title'),
+            normalized_journal_name=normalized_text_annotation('journal__name'),
+        )
+        .filter(
+            Q(normalized_title__icontains=query_normalized) |
+            Q(normalized_journal_name__icontains=query_normalized) |
+            Q(id__in=article_ids_by_author) |
+            Q(title__icontains=query) |
+            Q(doi__icontains=query) |
+            Q(issn__icontains=query) |
+            Q(journal__name__icontains=query) |
+            Q(journal__issn__icontains=query) |
+            Q(normalized_issn=query_identifier) |
+            Q(normalized_journal_issn=query_identifier) |
+            Q(normalized_doi=query_doi)
+        )
+        .distinct()
+        .order_by('-year', 'title')[:per_type_limit]
+    )
+
+    books_qs = (
+        Book.objects.select_related('publisher', 'group')
+        .annotate(
+            normalized_isbn=identifier_annotation('isbn'),
+            normalized_title=normalized_text_annotation('title'),
+        )
+        .filter(
+            Q(normalized_title__icontains=query_normalized) |
+            Q(id__in=book_ids_by_author) |
+            Q(title__icontains=query) |
+            Q(isbn__icontains=query) |
+            Q(normalized_isbn=query_identifier)
+        )
+        .distinct()
+        .order_by('-year', 'title')[:per_type_limit]
+    )
+
+    chapters_qs = (
+        BookChapter.objects.select_related('publisher', 'group')
+        .annotate(
+            normalized_isbn=identifier_annotation('isbn'),
+            normalized_chapter_title=normalized_text_annotation('chapter_title'),
+            normalized_book_title=normalized_text_annotation('book_title'),
+        )
+        .filter(
+            Q(normalized_chapter_title__icontains=query_normalized) |
+            Q(normalized_book_title__icontains=query_normalized) |
+            Q(id__in=chapter_ids_by_author) |
+            Q(chapter_title__icontains=query) |
+            Q(book_title__icontains=query) |
+            Q(isbn__icontains=query) |
+            Q(normalized_isbn=query_identifier)
+        )
+        .distinct()
+        .order_by('-year', 'chapter_title')[:per_type_limit]
+    )
+
+    researchers = [
+        {
+            'id': str(r.id),
+            'name': r.name,
+            'category': r.category,
+            'codeRh': r.code_rh,
+            'detailPath': f'/investigadores/{r.id}',
+        }
+        for r in researchers_qs
+    ]
+
+    groups = [
+        {
+            'id': str(g.id),
+            'name': g.name,
+            'code': g.code,
+            'leader': g.leader,
+            'category': g.category,
+            'detailPath': f'/groups/{g.id}',
+        }
+        for g in groups_qs
+    ]
+
+    articles = [
+        {
+            'id': str(a.id),
+            'title': a.title,
+            'year': a.year,
+            'doi': a.doi,
+            'issn': a.issn or (a.journal.issn if a.journal else None),
+            'journal': a.journal.name if a.journal else None,
+            'groupName': a.group.name if a.group else None,
+            'detailPath': f'/articulos/{a.id}',
+        }
+        for a in articles_qs
+    ]
+
+    books = [
+        {
+            'id': str(b.id),
+            'title': b.title,
+            'year': b.year,
+            'isbn': b.isbn,
+            'publisher': b.publisher.name if b.publisher else None,
+            'groupName': b.group.name if b.group else None,
+            'detailPath': f'/libros/{b.id}',
+        }
+        for b in books_qs
+    ]
+
+    book_chapters = [
+        {
+            'id': str(c.id),
+            'chapterTitle': c.chapter_title,
+            'bookTitle': c.book_title,
+            'year': c.year,
+            'isbn': c.isbn,
+            'publisher': c.publisher.name if c.publisher else None,
+            'groupName': c.group.name if c.group else None,
+            'detailPath': f'/capitulos/{c.id}',
+        }
+        for c in chapters_qs
+    ]
+
+    # Defensive dedupe for joins with authors and other related records.
+    researchers = unique_by_id(researchers)
+    groups = unique_by_id(groups)
+    articles = unique_by_id(articles)
+    books = unique_by_id(books)
+    book_chapters = unique_by_id(book_chapters)
+
+    return Response(
+        {
+            'query': query,
+            'totals': {
+                'researchers': len(researchers),
+                'groups': len(groups),
+                'articles': len(articles),
+                'books': len(books),
+                'bookChapters': len(book_chapters),
+                'all': len(researchers) + len(groups) + len(articles) + len(books) + len(book_chapters),
+            },
+            'results': {
+                'researchers': researchers,
+                'groups': groups,
+                'articles': articles,
+                'books': books,
+                'bookChapters': book_chapters,
+            },
+        }
+    )
+
+
+@api_view(['GET'])
+def get_researcher_detail(request, researcher_id):
+    researcher = Researcher.objects.filter(id=researcher_id).first()
+    if not researcher:
+        return Response({'error': 'Researcher not found'}, status=404)
+
+    return Response(_build_researcher_detail_payload(researcher))
+
+
+def _build_researcher_detail_payload(researcher):
+    groups = ResearchGroup.objects.filter(members__researcher=researcher).distinct().order_by('name')
+
+    articles = Article.objects.filter(authors__researcher=researcher).select_related('journal', 'group', 'product_type_obj').distinct().order_by('-year', 'title')
+    books = Book.objects.filter(authors__researcher=researcher).select_related('publisher', 'group').distinct().order_by('-year', 'title')
+    chapters = BookChapter.objects.filter(authors__researcher=researcher).select_related('publisher', 'group').distinct().order_by('-year', 'chapter_title')
+
+    article_ids = [a.id for a in articles]
+    book_ids = [b.id for b in books]
+    chapter_ids = [c.id for c in chapters]
+
+    article_author_counts = dict(
+        ArticleAuthor.objects.filter(article_id__in=article_ids)
+        .values('article_id')
+        .annotate(total=Count('id'))
+        .values_list('article_id', 'total')
+    )
+    book_author_counts = dict(
+        BookAuthor.objects.filter(book_id__in=book_ids)
+        .values('book_id')
+        .annotate(total=Count('id'))
+        .values_list('book_id', 'total')
+    )
+    chapter_author_counts = dict(
+        ChapterAuthor.objects.filter(chapter_id__in=chapter_ids)
+        .values('chapter_id')
+        .annotate(total=Count('id'))
+        .values_list('chapter_id', 'total')
+    )
+
+    article_categories_by_id = {}
+    article_categories_qs = (
+        ArticleCategory.objects.filter(article_id__in=article_ids)
+        .select_related('source')
+        .values('article_id', 'year', 'category', 'source__name')
+    )
+    for row in article_categories_qs:
+        article_categories_by_id.setdefault(row['article_id'], []).append(row)
+
+    def resolve_article_category(article):
+        rows = article_categories_by_id.get(article.id, [])
+        if not rows:
+            return {
+                'category': 'N/R',
+                'source': None,
+            }
+
+        target_year = article.year
+        if target_year is not None:
+            filtered = [r for r in rows if r.get('year') == target_year]
+            if filtered:
+                rows = filtered
+
+        by_source = {}
+        for row in rows:
+            source_name = (row.get('source__name') or '').upper().strip() or 'OTRA FUENTE'
+            current = by_source.get(source_name)
+            if not current or (row.get('year') or 0) >= (current.get('year') or 0):
+                by_source[source_name] = row
+
+        selected = None
+        selected_source = None
+
+        publindex_row = by_source.get('PUBLINDEX')
+        scimago_row = by_source.get('SCIMAGO')
+
+        if publindex_row and publindex_row.get('category'):
+            selected = publindex_row.get('category')
+            selected_source = 'Publindex'
+        elif scimago_row and scimago_row.get('category'):
+            selected = scimago_row.get('category')
+            selected_source = 'Scimago'
+
+        if selected:
+            return {
+                'category': str(selected),
+                'source': selected_source,
+            }
+
+        return {
+            'category': 'N/R',
+            'source': None,
+        }
+
+    thesis_tutor_links = ThesisTutor.objects.filter(researcher=researcher).select_related('thesis').order_by('-thesis__year', 'thesis__title', 'order')
+    thesis_student_links = ThesisStudent.objects.filter(researcher=researcher).select_related('thesis').order_by('-thesis__year', 'thesis__title')
+
+    tutor_thesis_ids = [link.thesis_id for link in thesis_tutor_links]
+    student_thesis_ids = [link.thesis_id for link in thesis_student_links]
+    thesis_ids = list(set(tutor_thesis_ids + student_thesis_ids))
+
+    thesis_map = {
+        thesis.id: thesis
+        for thesis in Thesis.objects.filter(id__in=thesis_ids).select_related('institution_obj').order_by('-year', 'title')
+    }
+
+    thesis_students_by_thesis = {}
+    thesis_students_qs = ThesisStudent.objects.filter(thesis_id__in=thesis_ids).order_by('order', 'student_name')
+    for student in thesis_students_qs:
+        thesis_students_by_thesis.setdefault(student.thesis_id, []).append(student.student_name)
+
+    thesis_as_director = []
+    thesis_as_cotutor = []
+    thesis_as_student = []
+
+    for link in thesis_tutor_links:
+        thesis = thesis_map.get(link.thesis_id)
+        if not thesis:
+            continue
+        thesis_row = {
+            'id': str(thesis.id),
+            'title': thesis.title,
+            'year': thesis.year,
+            'thesisType': thesis.thesis_type,
+            'institution': thesis.institution_obj.name if thesis.institution_obj else thesis.institution,
+            'students': thesis_students_by_thesis.get(thesis.id, []),
+        }
+        if link.order == 0:
+            _append_unique_thesis_row(thesis_as_director, thesis_row, 'students')
+        else:
+            _append_unique_thesis_row(thesis_as_cotutor, thesis_row, 'students')
+
+    for link in thesis_student_links:
+        thesis = thesis_map.get(link.thesis_id)
+        if not thesis:
+            continue
+        _append_unique_thesis_row(
+            thesis_as_student,
+            {
+                'id': str(thesis.id),
+                'title': thesis.title,
+                'year': thesis.year,
+                'thesisType': thesis.thesis_type,
+                'institution': thesis.institution_obj.name if thesis.institution_obj else thesis.institution,
+                'tutors': [
+                    t.tutor_name
+                    for t in ThesisTutor.objects.filter(thesis=thesis).order_by('order', 'tutor_name')
+                ],
+            },
+            'tutors',
+        )
+
+    def unique_articles(items):
+        seen = set()
+        unique_rows = []
+        for item in items:
+            key = (
+                _normalize_text_key(item.title),
+                item.year or None,
+                _normalize_text_key(item.doi),
+                _normalize_text_key(item.issn or (item.journal.issn if item.journal else None)),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_rows.append(item)
+        return unique_rows
+
+    def unique_books(items):
+        seen = set()
+        unique_rows = []
+        for item in items:
+            key = (
+                _normalize_text_key(item.title),
+                item.year or None,
+                _normalize_text_key(item.isbn),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_rows.append(item)
+        return unique_rows
+
+    def unique_chapters(items):
+        seen = set()
+        unique_rows = []
+        for item in items:
+            key = (
+                _normalize_text_key(item.chapter_title),
+                _normalize_text_key(item.book_title),
+                item.year or None,
+                _normalize_text_key(item.isbn),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_rows.append(item)
+        return unique_rows
+
+    unique_article_rows = unique_articles(list(articles))[:200]
+    unique_book_rows = unique_books(list(books))[:200]
+    unique_chapter_rows = unique_chapters(list(chapters))[:200]
+
+    return {
+        'id': str(researcher.id),
+        'name': researcher.name,
+        'codeRh': researcher.code_rh,
+        'category': researcher.category,
+        'educationLevel': researcher.education_level,
+        'city': researcher.city,
+        'department': researcher.department,
+        'university': researcher.university,
+        'cvlacUrl': researcher.cvlac_url,
+        'groups': [
+            {
+                'id': str(group.id),
+                'name': group.name,
+                'code': group.code,
+            }
+            for group in groups
+        ],
+        'products': {
+            'articles': [
+                {
+                    'id': str(article.id),
+                    'title': article.title,
+                    'year': article.year,
+                    'category': resolved_category['category'],
+                    'categorySource': resolved_category['source'],
+                    'issn': article.issn or (article.journal.issn if article.journal else None),
+                    'doi': article.doi,
+                    'researchersCount': article_author_counts.get(article.id, 0),
+                    'detailPath': f'/articulos/{article.id}',
+                }
+                for article in unique_article_rows
+                for resolved_category in [resolve_article_category(article)]
+            ],
+            'books': [
+                {
+                    'id': str(book.id),
+                    'title': book.title,
+                    'year': book.year,
+                    'isbn': book.isbn,
+                    'publisher': book.publisher.name if book.publisher else None,
+                    'researchersCount': book_author_counts.get(book.id, 0),
+                    'detailPath': f'/libros/{book.id}',
+                }
+                for book in unique_book_rows
+            ],
+            'bookChapters': [
+                {
+                    'id': str(chapter.id),
+                    'chapterTitle': chapter.chapter_title,
+                    'bookTitle': chapter.book_title,
+                    'year': chapter.year,
+                    'isbn': chapter.isbn,
+                    'publisher': chapter.publisher.name if chapter.publisher else None,
+                    'researchersCount': chapter_author_counts.get(chapter.id, 0),
+                    'detailPath': f'/capitulos/{chapter.id}',
+                }
+                for chapter in unique_chapter_rows
+            ],
+        },
+        'theses': {
+            'asDirector': thesis_as_director,
+            'asCotutor': thesis_as_cotutor,
+            'asStudent': thesis_as_student,
+        },
+    }
+
+
+@api_view(['GET'])
+def export_researcher_detail_excel(request, researcher_id):
+    researcher = Researcher.objects.filter(id=researcher_id).first()
+    if not researcher:
+        return Response({'error': 'Researcher not found'}, status=404)
+
+    data = _build_researcher_detail_payload(researcher)
+
+    workbook = Workbook()
+    default_sheet = workbook.active
+    workbook.remove(default_sheet)
+
+    # Frontend primary tone: hsl(162 47% 18%) ~= #184336
+    header_fill = PatternFill(start_color='184336', end_color='184336', fill_type='solid')
+    header_font = Font(color='FFFFFF', bold=True)
+    title_font = Font(size=18, bold=True, color='184336')
+    thin_border = Border(
+        left=Side(style='thin', color='D1D5DB'),
+        right=Side(style='thin', color='D1D5DB'),
+        top=Side(style='thin', color='D1D5DB'),
+        bottom=Side(style='thin', color='D1D5DB'),
+    )
+
+    def style_table_header(sheet, total_columns):
+        for col_idx in range(1, total_columns + 1):
+            cell = sheet.cell(row=1, column=col_idx)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            cell.border = thin_border
+        sheet.freeze_panes = 'A2'
+
+    def auto_fit_columns(sheet, min_width=12, max_width=60):
+        for col_cells in sheet.columns:
+            max_len = 0
+            col_letter = get_column_letter(col_cells[0].column)
+            for cell in col_cells:
+                cell_value = '' if cell.value is None else str(cell.value)
+                max_len = max(max_len, len(cell_value))
+            sheet.column_dimensions[col_letter].width = max(min(max_len + 2, max_width), min_width)
+
+    cover_sheet = workbook.create_sheet('Portada', 0)
+    code_rh = (researcher.code_rh or 'SIN-CODIGO').strip()
+    researcher_name = (researcher.name or 'Investigador').strip()
+
+    cover_sheet.merge_cells('A1:E1')
+    cover_sheet['A1'] = 'Ficha de Investigador'
+    cover_sheet['A1'].font = title_font
+    cover_sheet['A1'].alignment = Alignment(horizontal='center', vertical='center')
+
+    cover_sheet['A3'] = 'Código RH'
+    cover_sheet['B3'] = code_rh
+    cover_sheet['A4'] = 'Nombre del Investigador'
+    cover_sheet['B4'] = researcher_name
+    cover_sheet['A5'] = 'Categoría'
+    cover_sheet['B5'] = researcher.category or 'N/A'
+    cover_sheet['A6'] = 'Formación'
+    cover_sheet['B6'] = researcher.education_level or 'N/A'
+    cover_sheet['A7'] = 'Fecha de generación'
+    cover_sheet['B7'] = timezone.localtime().strftime('%Y-%m-%d %H:%M')
+
+    for row in range(3, 8):
+        label_cell = cover_sheet[f'A{row}']
+        value_cell = cover_sheet[f'B{row}']
+        label_cell.font = Font(bold=True, color='184336')
+        label_cell.fill = PatternFill(start_color='E6F1EE', end_color='E6F1EE', fill_type='solid')
+        label_cell.alignment = Alignment(horizontal='left', vertical='center')
+        label_cell.border = thin_border
+        value_cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+        value_cell.border = thin_border
+
+    cover_sheet.column_dimensions['A'].width = 28
+    cover_sheet.column_dimensions['B'].width = 60
+    cover_sheet.row_dimensions[1].height = 30
+
+    ws_articles = workbook.create_sheet('Articulos')
+    ws_articles.append(['Título', 'Año', 'Categoría', 'Fuente', 'ISSN', 'DOI', 'No. Investigadores'])
+    for row in data['products']['articles']:
+        category_value = (row.get('category') or '').strip() if isinstance(row.get('category'), str) else row.get('category')
+        category_value = category_value if category_value else 'N/R'
+        source_value = (row.get('categorySource') or '').strip() if isinstance(row.get('categorySource'), str) else row.get('categorySource')
+        source_value = source_value if source_value else 'N/R'
+
+        if category_value == 'N/R':
+            source_value = 'N/R'
+
+        ws_articles.append([
+            row['title'],
+            row.get('year'),
+            category_value,
+            source_value,
+            row.get('issn'),
+            row.get('doi'),
+            row.get('researchersCount'),
+        ])
+    style_table_header(ws_articles, 7)
+    auto_fit_columns(ws_articles)
+
+    ws_books = workbook.create_sheet('Libros')
+    ws_books.append(['Título', 'Año', 'ISBN', 'Editorial', 'No. Investigadores'])
+    for row in data['products']['books']:
+        ws_books.append([
+            row['title'],
+            row.get('year'),
+            row.get('isbn'),
+            row.get('publisher'),
+            row.get('researchersCount'),
+        ])
+    style_table_header(ws_books, 5)
+    auto_fit_columns(ws_books)
+
+    ws_chapters = workbook.create_sheet('Capitulos')
+    ws_chapters.append(['Capítulo', 'Libro', 'Año', 'ISBN', 'Editorial', 'No. Investigadores'])
+    for row in data['products']['bookChapters']:
+        ws_chapters.append([
+            row.get('chapterTitle'),
+            row.get('bookTitle'),
+            row.get('year'),
+            row.get('isbn'),
+            row.get('publisher'),
+            row.get('researchersCount'),
+        ])
+    style_table_header(ws_chapters, 6)
+    auto_fit_columns(ws_chapters)
+
+    ws_theses = workbook.create_sheet('Tesis')
+    ws_theses.append(['Rol', 'Título', 'Año', 'Tipo', 'Institución', 'Relacionados'])
+
+    for row in data['theses']['asDirector']:
+        ws_theses.append(['Director', row.get('title'), row.get('year'), row.get('thesisType'), row.get('institution'), ', '.join(row.get('students', []))])
+    for row in data['theses']['asCotutor']:
+        ws_theses.append(['Cotutor', row.get('title'), row.get('year'), row.get('thesisType'), row.get('institution'), ', '.join(row.get('students', []))])
+    for row in data['theses']['asStudent']:
+        ws_theses.append(['Estudiante', row.get('title'), row.get('year'), row.get('thesisType'), row.get('institution'), ', '.join(row.get('tutors', []))])
+    style_table_header(ws_theses, 6)
+    auto_fit_columns(ws_theses)
+
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+
+    safe_code = re.sub(r'[\\/:*?"<>|]+', '-', code_rh).strip() or 'SIN-CODIGO'
+    safe_name = re.sub(r'[\\/:*?"<>|]+', ' ', researcher_name).strip() or 'Investigador'
+    safe_name = re.sub(r'\s+', ' ', safe_name)
+    filename = f"Ficha-CodigoRH-{safe_code}-{safe_name}.xlsx"
+    response = HttpResponse(
+        output.getvalue(),
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    )
+    response['Content-Disposition'] = f'attachment; filename="{filename}"'
+    return response
+
+
+@api_view(['GET'])
+def get_article_detail(request, article_id):
+    article = Article.objects.select_related('group', 'journal', 'country', 'city').filter(id=article_id).first()
+    if not article:
+        return Response({'error': 'Article not found'}, status=404)
+
+    authors = ArticleAuthor.objects.filter(article=article).select_related('researcher').order_by('order', 'author_name')
+    related_articles = Article.objects.filter(group=article.group).exclude(id=article.id).distinct().order_by('-year', 'title')[:15]
+
+    return Response(
+        {
+            'id': str(article.id),
+            'title': article.title,
+            'year': article.year,
+            'doi': article.doi,
+            'doiSuffix': article.doi_suffix,
+            'issn': article.issn,
+            'volume': article.volume,
+            'issue': article.issue,
+            'pages': article.pages,
+            'productType': article.product_type,
+            'group': {
+                'id': str(article.group.id),
+                'name': article.group.name,
+                'code': article.group.code,
+            } if article.group else None,
+            'journal': {
+                'id': str(article.journal.id),
+                'name': article.journal.name,
+                'issn': article.journal.issn,
+            } if article.journal else None,
+            'location': {
+                'country': article.country.name if article.country else None,
+                'city': article.city.name if article.city else None,
+            },
+            'authors': [
+                {
+                    'name': author.author_name,
+                    'isGroupMember': author.is_group_member,
+                    'researcherId': str(author.researcher.id) if author.researcher else None,
+                    'researcherPath': f'/investigadores/{author.researcher.id}' if author.researcher else None,
+                }
+                for author in authors
+            ],
+            'related': {
+                'articlesFromGroup': [
+                    {
+                        'id': str(item.id),
+                        'title': item.title,
+                        'year': item.year,
+                        'detailPath': f'/articulos/{item.id}',
+                    }
+                    for item in related_articles
+                ]
+            }
+        }
+    )
+
+
+@api_view(['GET'])
+def get_book_detail(request, book_id):
+    book = Book.objects.select_related('group', 'publisher', 'country', 'city').filter(id=book_id).first()
+    if not book:
+        return Response({'error': 'Book not found'}, status=404)
+
+    authors = BookAuthor.objects.filter(book=book).select_related('researcher').order_by('order', 'author_name')
+    related_chapters_qs = BookChapter.objects.filter(group=book.group).filter(
+        Q(isbn=book.isbn) |
+        Q(book_title__iexact=book.title)
+    ).distinct().order_by('-year', 'chapter_title')
+
+    related_books = Book.objects.filter(group=book.group).exclude(id=book.id).distinct().order_by('-year', 'title')[:15]
+
+    return Response(
+        {
+            'id': str(book.id),
+            'title': book.title,
+            'year': book.year,
+            'isbn': book.isbn,
+            'productType': book.product_type,
+            'group': {
+                'id': str(book.group.id),
+                'name': book.group.name,
+                'code': book.group.code,
+            } if book.group else None,
+            'publisher': {
+                'id': str(book.publisher.id),
+                'name': book.publisher.name,
+            } if book.publisher else None,
+            'location': {
+                'country': book.country.name if book.country else None,
+                'city': book.city.name if book.city else None,
+            },
+            'authors': [
+                {
+                    'name': author.author_name,
+                    'isGroupMember': author.is_group_member,
+                    'researcherId': str(author.researcher.id) if author.researcher else None,
+                    'researcherPath': f'/investigadores/{author.researcher.id}' if author.researcher else None,
+                }
+                for author in authors
+            ],
+            'related': {
+                'chapters': [
+                    {
+                        'id': str(chapter.id),
+                        'chapterTitle': chapter.chapter_title,
+                        'bookTitle': chapter.book_title,
+                        'year': chapter.year,
+                        'detailPath': f'/capitulos/{chapter.id}',
+                    }
+                    for chapter in related_chapters_qs[:30]
+                ],
+                'booksFromGroup': [
+                    {
+                        'id': str(item.id),
+                        'title': item.title,
+                        'year': item.year,
+                        'detailPath': f'/libros/{item.id}',
+                    }
+                    for item in related_books
+                ],
+            },
+        }
+    )
+
+
+@api_view(['GET'])
+def get_book_chapter_detail(request, chapter_id):
+    chapter = BookChapter.objects.select_related('group', 'publisher').filter(id=chapter_id).first()
+    if not chapter:
+        return Response({'error': 'Book chapter not found'}, status=404)
+
+    authors = ChapterAuthor.objects.filter(chapter=chapter).select_related('researcher').order_by('order', 'author_name')
+    related_books_qs = Book.objects.filter(group=chapter.group).filter(
+        Q(isbn=chapter.isbn) |
+        Q(title__iexact=chapter.book_title)
+    ).distinct().order_by('-year', 'title')
+
+    related_chapters_qs = BookChapter.objects.filter(group=chapter.group).exclude(id=chapter.id).filter(
+        Q(isbn=chapter.isbn) |
+        Q(book_title__iexact=chapter.book_title)
+    ).distinct().order_by('-year', 'chapter_title')
+
+    return Response(
+        {
+            'id': str(chapter.id),
+            'chapterTitle': chapter.chapter_title,
+            'bookTitle': chapter.book_title,
+            'year': chapter.year,
+            'isbn': chapter.isbn,
+            'productType': chapter.product_type,
+            'group': {
+                'id': str(chapter.group.id),
+                'name': chapter.group.name,
+                'code': chapter.group.code,
+            } if chapter.group else None,
+            'publisher': {
+                'id': str(chapter.publisher.id),
+                'name': chapter.publisher.name,
+            } if chapter.publisher else None,
+            'authors': [
+                {
+                    'name': author.author_name,
+                    'isGroupMember': author.is_group_member,
+                    'researcherId': str(author.researcher.id) if author.researcher else None,
+                    'researcherPath': f'/investigadores/{author.researcher.id}' if author.researcher else None,
+                }
+                for author in authors
+            ],
+            'related': {
+                'books': [
+                    {
+                        'id': str(book.id),
+                        'title': book.title,
+                        'year': book.year,
+                        'detailPath': f'/libros/{book.id}',
+                    }
+                    for book in related_books_qs[:20]
+                ],
+                'chaptersFromSameBook': [
+                    {
+                        'id': str(item.id),
+                        'chapterTitle': item.chapter_title,
+                        'year': item.year,
+                        'detailPath': f'/capitulos/{item.id}',
+                    }
+                    for item in related_chapters_qs[:20]
+                ],
+            },
+        }
+    )
+
+
+def _build_group_detail_payload(group):
+    # Researchers associated
+    # group.members relates to GroupMember
+    members = group.members.select_related('researcher').all()
+    member_researcher_ids = {m.researcher_id for m in members if m.researcher_id}
+    researchers_data = [
+        {
+            'id': str(m.researcher.id),
+            'name': m.researcher.name,
+            'codeRh': m.researcher.code_rh,
+            'category': m.researcher.category,
+            'membershipType': m.membership_type,
+            'status': m.status,
+            'detailPath': f'/investigadores/{m.researcher.id}',
+        }
+        for m in members
+        if m.researcher
+    ]
+
+    # Articles
+    articles = Article.objects.filter(group=group).order_by('-year', 'title')[:200]
+    
+    article_ids = [a.id for a in articles]
+    
+    article_categories_by_id = {}
+    article_categories_qs = (
+        ArticleCategory.objects.filter(article_id__in=article_ids)
+        .select_related('source')
+        .values('article_id', 'year', 'category', 'source__name')
+    )
+    for row in article_categories_qs:
+        article_categories_by_id.setdefault(row['article_id'], []).append(row)
+
+    def resolve_article_category(article):
+        rows = article_categories_by_id.get(article.id, [])
+        if not rows:
+            return {
+                'category': 'N/R',
+                'source': None,
+            }
+
+        target_year = article.year
+        if target_year is not None:
+            filtered = [r for r in rows if r.get('year') == target_year]
+            if filtered:
+                rows = filtered
+
+        by_source = {}
+        for row in rows:
+            source_name = (row.get('source__name') or '').upper().strip() or 'OTRA FUENTE'
+            current = by_source.get(source_name)
+            if not current or (row.get('year') or 0) >= (current.get('year') or 0):
+                by_source[source_name] = row
+
+        selected = None
+        selected_source = None
+
+        publindex_row = by_source.get('PUBLINDEX')
+        scimago_row = by_source.get('SCIMAGO')
+
+        if publindex_row and publindex_row.get('category'):
+            selected = publindex_row.get('category')
+            selected_source = 'Publindex'
+        elif scimago_row and scimago_row.get('category'):
+            selected = scimago_row.get('category')
+            selected_source = 'Scimago'
+
+        if selected:
+            return {
+                'category': str(selected),
+                'source': selected_source,
+            }
+
+        return {
+            'category': 'N/R',
+            'source': None,
+        }
+    
+    # Calculate researchers explicitly grouped by product, getting names instead of just counts
+    article_authors_qs = ArticleAuthor.objects.filter(article_id__in=article_ids).values('article_id', 'author_name', 'researcher_id').order_by('order')
+    article_authors_by_id = {}
+    for aa in article_authors_qs:
+        article_authors_by_id.setdefault(aa['article_id'], []).append({
+            'name': aa['author_name'],
+            'isGroupMember': aa['researcher_id'] in member_researcher_ids if aa['researcher_id'] else False
+        })
+
+    articles_data = [
+        {
+            'id': str(a.id),
+            'title': a.title,
+            'year': a.year,
+            'category': resolve_article_category(a)['category'],
+            'categorySource': resolve_article_category(a)['source'],
+            'doi': a.doi,
+            'issn': a.issn,
+            'authors': article_authors_by_id.get(a.id, []),
+            'detailPath': f'/articulos/{a.id}'
+        }
+        for a in articles
+    ]
+
+    # Books
+    books = Book.objects.filter(group=group).order_by('-year', 'title')[:200]
+    book_ids = [b.id for b in books]
+    book_authors_qs = BookAuthor.objects.filter(book_id__in=book_ids).values('book_id', 'author_name', 'researcher_id').order_by('order')
+    book_authors_by_id = {}
+    for ba in book_authors_qs:
+        book_authors_by_id.setdefault(ba['book_id'], []).append({
+            'name': ba['author_name'],
+            'isGroupMember': ba['researcher_id'] in member_researcher_ids if ba['researcher_id'] else False
+        })
+
+    books_data = [
+        {
+            'id': str(b.id),
+            'title': b.title,
+            'year': b.year,
+            'isbn': b.isbn,
+            'authors': book_authors_by_id.get(b.id, []),
+            'detailPath': f'/libros/{b.id}'
+        }
+        for b in books
+    ]
+
+    # Chapters
+    chapters = BookChapter.objects.filter(group=group).order_by('-year', 'chapter_title')[:200]
+    chapter_ids = [c.id for c in chapters]
+    chapter_authors_qs = ChapterAuthor.objects.filter(chapter_id__in=chapter_ids).values('chapter_id', 'author_name', 'researcher_id').order_by('order')
+    chapter_authors_by_id = {}
+    for ca in chapter_authors_qs:
+        chapter_authors_by_id.setdefault(ca['chapter_id'], []).append({
+            'name': ca['author_name'],
+            'isGroupMember': ca['researcher_id'] in member_researcher_ids if ca['researcher_id'] else False
+        })
+
+    chapters_data = [
+        {
+            'id': str(c.id),
+            'chapterTitle': c.chapter_title,
+            'bookTitle': c.book_title,
+            'year': c.year,
+            'isbn': c.isbn,
+            'authors': chapter_authors_by_id.get(c.id, []),
+            'detailPath': f'/capitulos/{c.id}'
+        }
+        for c in chapters
+    ]
+
+    # Theses
+    theses = Thesis.objects.filter(group=group).order_by('-year', 'title')[:200]
+    thesis_ids = [t.id for t in theses]
+    thesis_authors_by_id = {}
+
+    tutors_qs = ThesisTutor.objects.filter(thesis_id__in=thesis_ids).values('thesis_id', 'tutor_name', 'researcher_id').order_by('order')
+    for tq in tutors_qs:
+        thesis_authors_by_id.setdefault(tq['thesis_id'], []).append({
+            'name': tq['tutor_name'],
+            'isGroupMember': tq['researcher_id'] in member_researcher_ids if tq['researcher_id'] else False,
+            'role': 'Tutor/Director'
+        })
+
+    students_qs = ThesisStudent.objects.filter(thesis_id__in=thesis_ids).values('thesis_id', 'student_name', 'researcher_id').order_by('order')
+    for sq in students_qs:
+        thesis_authors_by_id.setdefault(sq['thesis_id'], []).append({
+            'name': sq['student_name'],
+            'isGroupMember': sq['researcher_id'] in member_researcher_ids if sq['researcher_id'] else False,
+            'role': 'Estudiante'
+        })
+
+    theses_data = [
+        {
+            'id': str(t.id),
+            'title': t.title,
+            'year': t.year,
+            'thesisType': t.thesis_type,
+            'institution': t.institution_obj.name if t.institution_obj else t.institution,
+            'authors': thesis_authors_by_id.get(t.id, []),
+            # we skip detailPath since we typically don't have thesis detail pages yet, but we could
+        }
+        for t in theses
+    ]
+
+    return {
+        'id': str(group.id),
+        'code': group.code,
+        'name': group.name,
+        'leader': group.leader,
+        'category': group.category,
+        'formationDateInfo': group.formation_date_info,
+        'department': group.department,
+        'city': group.city,
+        'certificationStatus': group.certification_status,
+        'website': group.website,
+        'email': group.email,
+        'classificationValidity': group.classification_validity,
+        'researchers': researchers_data,
+        'products': {
+            'articles': articles_data,
+            'books': books_data,
+            'bookChapters': chapters_data,
+            'theses': theses_data,
+        }
+    }
+
+@api_view(['GET'])
+def get_group_detail(request, group_id):
+    group = ResearchGroup.objects.filter(id=group_id).first()
+    if not group:
+        return Response({'error': 'Group not found'}, status=404)
+
+    return Response(_build_group_detail_payload(group))
+
+@api_view(['GET'])
+def export_group_detail_excel(request, group_id):
+    group = ResearchGroup.objects.filter(id=group_id).first()
+    if not group:
+        return Response({'error': 'Group not found'}, status=404)
+
+    data = _build_group_detail_payload(group)
+
+    workbook = Workbook()
+    default_sheet = workbook.active
+    workbook.remove(default_sheet)
+
+    # Frontend primary tone: hsl(162 47% 18%) ~= #184336
+    header_fill = PatternFill(start_color='184336', end_color='184336', fill_type='solid')
+    header_font = Font(color='FFFFFF', bold=True)
+    title_font = Font(size=18, bold=True, color='184336')
+    thin_border = Border(
+        left=Side(style='thin', color='D1D5DB'),
+        right=Side(style='thin', color='D1D5DB'),
+        top=Side(style='thin', color='D1D5DB'),
+        bottom=Side(style='thin', color='D1D5DB'),
+    )
+
+    def style_table_header(sheet, total_columns):
+        for col_idx in range(1, total_columns + 1):
+            cell = sheet.cell(row=1, column=col_idx)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            cell.border = thin_border
+        sheet.freeze_panes = 'A2'
+
+    def auto_fit_columns(sheet, min_width=12, max_width=60):
+        for col_cells in sheet.columns:
+            max_len = 0
+            col_letter = get_column_letter(col_cells[0].column)
+            for cell in col_cells:
+                cell_value = '' if cell.value is None else str(cell.value)
+                max_len = max(max_len, len(cell_value))
+            sheet.column_dimensions[col_letter].width = max(min(max_len + 2, max_width), min_width)
+
+    cover_sheet = workbook.create_sheet('Portada', 0)
+    group_code = (group.code or 'SIN-CODIGO').strip()
+    group_name = (group.name or 'Grupo').strip()
+
+    cover_sheet.merge_cells('A1:E1')
+    cover_sheet['A1'] = 'Ficha de Grupo de Investigación'
+    cover_sheet['A1'].font = title_font
+    cover_sheet['A1'].alignment = Alignment(horizontal='center', vertical='center')
+
+    cover_sheet['A3'] = 'Código MinCiencias'
+    cover_sheet['B3'] = group_code
+    cover_sheet['A4'] = 'Nombre del Grupo'
+    cover_sheet['B4'] = group_name
+    cover_sheet['A5'] = 'Categoría'
+    cover_sheet['B5'] = group.category or 'N/A'
+    cover_sheet['A6'] = 'Líder'
+    cover_sheet['B6'] = group.leader or 'N/A'
+    cover_sheet['A7'] = 'Fecha de generación'
+    cover_sheet['B7'] = timezone.localtime().strftime('%Y-%m-%d %H:%M')
+
+    for row in range(3, 8):
+        label_cell = cover_sheet[f'A{row}']
+        value_cell = cover_sheet[f'B{row}']
+        label_cell.font = Font(bold=True, color='184336')
+        label_cell.fill = PatternFill(start_color='E6F1EE', end_color='E6F1EE', fill_type='solid')
+        label_cell.alignment = Alignment(horizontal='left', vertical='center')
+        label_cell.border = thin_border
+        value_cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+        value_cell.border = thin_border
+
+    cover_sheet.column_dimensions['A'].width = 28
+    cover_sheet.column_dimensions['B'].width = 60
+    cover_sheet.row_dimensions[1].height = 30
+
+    ws_researchers = workbook.create_sheet('Investigadores')
+    ws_researchers.append(['Código RH', 'Nombre', 'Categoría', 'Tipo Vinculación', 'Estado'])
+    for row in data['researchers']:
+        status_text = 'Activo' if row.get('status') == 'ACTIVE' else ('Inactivo' if row.get('status') == 'INACTIVE' else row.get('status'))
+        ws_researchers.append([
+            row.get('codeRh') or 'N/A',
+            row.get('name'),
+            row.get('category') or 'N/A',
+            row.get('membershipType') or 'N/A',
+            status_text or 'N/A'
+        ])
+    style_table_header(ws_researchers, 5)
+    auto_fit_columns(ws_researchers)
+
+    ws_articles = workbook.create_sheet('Artículos')
+    ws_articles.append(['Título', 'Año', 'Categoría', 'Fuente', 'ISSN', 'DOI', 'Investigadores del Grupo', 'Otros Investigadores'])
+    for row in data['products']['articles']:
+        category_value = (row.get('category') or '').strip() if isinstance(row.get('category'), str) else row.get('category')
+        category_value = category_value if category_value else 'N/R'
+        source_value = (row.get('categorySource') or '').strip() if isinstance(row.get('categorySource'), str) else row.get('categorySource')
+        source_value = source_value if source_value else 'N/R'
+
+        if category_value == 'N/R':
+            source_value = 'N/R'
+
+        ws_articles.append([
+            row['title'],
+            row.get('year'),
+            category_value,
+            source_value,
+            row.get('issn'),
+            row.get('doi'),
+            ', '.join([a.get('name', '') for a in row.get('authors', []) if a.get('isGroupMember')]),
+            ', '.join([a.get('name', '') for a in row.get('authors', []) if not a.get('isGroupMember')]),
+        ])
+    style_table_header(ws_articles, 8)
+    auto_fit_columns(ws_articles)
+
+    ws_books = workbook.create_sheet('Libros')
+    ws_books.append(['Título', 'Año', 'ISBN', 'Investigadores del Grupo', 'Otros Investigadores'])
+    for row in data['products']['books']:
+        ws_books.append([
+            row['title'],
+            row.get('year'),
+            row.get('isbn'),
+            ', '.join([a.get('name', '') for a in row.get('authors', []) if a.get('isGroupMember')]),
+            ', '.join([a.get('name', '') for a in row.get('authors', []) if not a.get('isGroupMember')]),
+        ])
+    style_table_header(ws_books, 5)
+    auto_fit_columns(ws_books)
+
+    ws_chapters = workbook.create_sheet('Capítulos')
+    ws_chapters.append(['Capítulo', 'Libro', 'Año', 'ISBN', 'Investigadores del Grupo', 'Otros Investigadores'])
+    for row in data['products']['bookChapters']:
+        ws_chapters.append([
+            row.get('chapterTitle'),
+            row.get('bookTitle'),
+            row.get('year'),
+            row.get('isbn'),
+            ', '.join([a.get('name', '') for a in row.get('authors', []) if a.get('isGroupMember')]),
+            ', '.join([a.get('name', '') for a in row.get('authors', []) if not a.get('isGroupMember')]),
+        ])
+    style_table_header(ws_chapters, 6)
+    auto_fit_columns(ws_chapters)
+
+    ws_theses = workbook.create_sheet('Tesis')
+    ws_theses.append(['Título', 'Año', 'Tipo', 'Institución', 'Involucrados del Grupo', 'Involucrados Externos'])
+    for row in data['products']['theses']:
+        ws_theses.append([
+            row.get('title'),
+            row.get('year'),
+            row.get('thesisType'),
+            row.get('institution'),
+            '\n'.join([f"{a.get('name', '')} - {a.get('role', '')}".strip(' -') for a in row.get('authors', []) if a.get('isGroupMember')]),
+            '\n'.join([f"{a.get('name', '')} - {a.get('role', '')}".strip(' -') for a in row.get('authors', []) if not a.get('isGroupMember')]),
+        ])
+    style_table_header(ws_theses, 6)
+    auto_fit_columns(ws_theses)
+
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+
+    safe_code = re.sub(r'[\\/:*?"<>|]+', '-', group_code).strip() or 'SIN-CODIGO'
+    safe_name = re.sub(r'[\\/:*?"<>|]+', ' ', group_name).strip() or 'Grupo'
+    safe_name = re.sub(r'\s+', ' ', safe_name)
+    filename = f"Ficha-Grupo-{safe_code}-{safe_name}.xlsx"
+    response = HttpResponse(
+        output.getvalue(),
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    )
+    response['Content-Disposition'] = f'attachment; filename="{filename}"'
+    return response
 
 @api_view(['GET'])
 def get_stats(request):

@@ -145,4 +145,6 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
 CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+# Desactivado el uso del broker externo, todas las tareas corren síncronas para evitar fallos por falta de Redis
+CELERY_TASK_ALWAYS_EAGER = True
 
