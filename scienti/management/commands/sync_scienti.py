@@ -8,7 +8,8 @@ from scienti.models import (
     ScientificEvent, EventInstitution,
     Institution, ProductType, AcademicProgram,
     Country, Department, City, Journal, Publisher,
-    ResearchLine, KnowledgeArea, NationalProgram
+    ResearchLine, KnowledgeArea, NationalProgram,
+    GenericProduct, GenericProductAuthor
 )
 import requests
 from bs4 import BeautifulSoup
@@ -18,6 +19,186 @@ import hashlib
 import unicodedata
 import time
 from difflib import SequenceMatcher
+
+class GenericProductParser:
+    def __init__(self):
+        self.TABLE_CATEGORIES = {
+            "Softwares": "DTeI",
+            "Diseños industriales": "DTeI",
+            "Nuevos registros científicos": "DTeI",
+            "Innovaciones generadas en la Gestión Empresarial": "DTeI",
+            "Innovaciones en Procesos y Procedimientos": "DTeI",
+            "Regulaciones y Normas": "DTeI",
+            "Conceptos técnicos": "DTeI",
+            "Guías de práctica clínica": "DTeI",
+            "Manuales y modelos de atención diferencial a víctimas": "DTeI",
+            "Protocolos de atención a usuarios/víctimas": "DTeI",
+            "Protocolos de vigilancia epidemiológica": "DTeI",
+            "Empresas de base tecnológica": "DTeI",
+            "Nuevas variedades vegetal / animal / genético": "DTeI",
+            "Procesos de apropiación social del Conocimiento para el fortalecimiento o solución de asuntos de interés social": "PASC",
+            "Productos de apropiación social del conocimiento resultado del trabajo conjunto entre un Centro de Ciencia y un grupo de investigación": "PASC",
+            "Proceso de Apropiación Social del Conocimiento para la generación de insumos de política pública y normatividad": "PASC",
+            "Proceso de apropiación social del Conocimiento para el fortalecimiento de cadenas productivas": "PASC",
+            "Generación de Contenido Impreso": "DP",
+            "Generación de Contenido Multimedia": "DP",
+            "Generación de Contenido Virtual": "DP",
+            "Generaciónes de contenido de audio": "DP",
+            "Producciones de contenido digital - Audiovisual": "DP",
+            "Producciones de contenido digital - Sonoro": "DP",
+            "Producciones de contenido digital - Recursos gráficos": "DP",
+            "Producción de estrategias y contenidos Transmedia": "DP",
+            "Desarrollo Web": "DP",
+            "Desarrollos Web": "DP",
+            "Boletines divulgativos de resultado de investigación": "DP",
+            "Otra publicación divulgativa": "DP",
+            "Libros de Divulgación de investigación y/o Compilación de Divulgación": "DP",
+            "Manuales y Guías Especializadas": "DP",
+            "Producción en arte, arquitectura y diseño": "DP",
+            "Otros Libros publicados": "DP",
+            "Talleres de Creación": "DP",
+            "Documentos de trabajo": "DP",
+            "Informes técnicos": "DP",
+            "Consultorías científico-tecnológicas": "DP",
+            "Publicaciones editoriales no especializadas": "DP",
+            "Estrategias de Comunicación del Conocimiento": "DP",
+            "Espacios de Participación Ciudadana": "PASC"
+        }
+
+    def _clean_text(self, text):
+        if not text:
+            return ""
+        text = str(text)
+        if text.strip().lower() == "null":
+            return ""
+        text = re.sub(r'\,{2,}', '', text)
+        text = re.sub(r'^\s*\d+[\.\-]*\s*', '', text)
+        return " ".join(text.split())
+
+    def _extract_year_month(self, text, full_text):
+        year = None
+        month = ""
+        m_date = re.search(r'\b(20\d{2}|19\d{2})[-/](0[1-9]|1[0-2]|[\w]+)[-/](\d{2})\b', text)
+        if m_date:
+            year, month = int(m_date.group(1)), m_date.group(2)
+        else:
+            m_year = re.search(r'\b(19\d{2}|20\d{2})\b', text)
+            if m_year: year = int(m_year.group(1))
+
+            m_month = re.search(r'Mes\w*:\s*([\w]+)', full_text, re.IGNORECASE)
+            if m_month:
+                month = self._clean_text(m_month.group(1))
+            else:
+                months = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
+                for p_month in months:
+                    if p_month.lower() in full_text.lower():
+                        month = p_month
+                        break
+        return year, month
+
+    def _parse_authors(self, text):
+        m = re.search(r'Autores?[\s:]+(.*)', text, re.IGNORECASE)
+        if m:
+            authors_str = self._clean_text(m.group(1))
+            return [a.strip() for a in authors_str.split(',') if a.strip()]
+        return []
+
+    def _extract_kv(self, raw_html, key, fallback=None):
+        pattern = rf'(?:{key})\s*:\s*(.*?)(?:,|<br|\n|$)'
+        m = re.search(pattern, raw_html, re.IGNORECASE)
+        if m:
+            val = self._clean_text(re.sub(r'<[^>]+>', '', m.group(1)))
+            return val if val.lower() != 'null' else ""
+        return fallback or ""
+
+    def parse_cell(self, table_name, raw_html):
+        soup = BeautifulSoup(raw_html, "html.parser")
+        text_content = soup.get_text(separator="\n")
+        full_text_flat = " ".join(text_content.split())
+        
+        parsed = {
+            "table_name": table_name,
+            "category": self.TABLE_CATEGORIES.get(table_name, "OTRO"),
+            "extra_data": {"raw_text": full_text_flat}
+        }
+        
+        parsed["title"] = ""
+        parsed["year"] = None
+        parsed["authors"] = []
+
+        strong_tag = soup.find('strong')
+        if strong_tag:
+            raw_strong = self._clean_text(strong_tag.get_text())
+            
+            if table_name in ["Espacios de Participación Ciudadana", "Estrategias de Comunicación del Conocimiento", "Procesos de apropiación social del Conocimiento para el fortalecimiento o solución de asuntos de interés social", "Talleres de Creación"]:
+                parsed["title"] = self._clean_text(raw_strong)
+                parsed["extra_data"]["tipo"] = table_name
+
+                m_tit = re.search(r'</strong>\s*:?\s*(.*?)(?:<br|\n|,)', raw_html, re.IGNORECASE)
+                if m_tit and len(self._clean_text(re.sub(r'<[^>]+>', '', m_tit.group(1)))) > 5:
+                    parsed["title"] = f"{parsed['title']} {self._clean_text(re.sub(r'<[^>]+>', '', m_tit.group(1)))}".strip()
+                
+                if "Nombre del" in raw_strong:
+                    m_tit = re.search(r'Nombre del (?:proceso|taller)\s*:?\s*(.*?)(?:<br|\n|,)', raw_html, re.IGNORECASE)
+                    if m_tit:
+                        parsed["title"] = self._clean_text(re.sub(r'<[^>]+>', '', m_tit.group(1)))
+            else:
+                parsed["extra_data"]["tipo"] = re.sub(r'^\d+[\.\-]*\s*', '', raw_strong)
+                m_tit = re.search(r'</strong>\s*:?\s*(.*?)(?:<br|\n)', raw_html, re.IGNORECASE)
+                if m_tit:
+                    parsed["title"] = self._clean_text(re.sub(r'<[^>]+>', '', m_tit.group(1)))
+                else: 
+                     sibling = strong_tag.next_sibling
+                     if sibling and isinstance(sibling, str):
+                         parsed["title"] = self._clean_text(sibling.replace(':', ''))
+        else:
+            lines = [l.strip() for l in text_content.split('\n') if l.strip()]
+            if lines:
+                parsed["title"] = self._clean_text(lines[0])
+                parsed["extra_data"]["tipo"] = table_name
+
+        parsed["title"] = self._clean_text(parsed["title"])
+
+        yr, mo = self._extract_year_month(text_content, full_text_flat)
+        parsed["year"] = yr
+        if mo: parsed["extra_data"]["mes"] = mo
+        parsed["authors"] = self._parse_authors(text_content)
+        
+        known_keys = [
+            ("disponibilidad", "Disponibilidad"), ("sitioWeb", r"Sitio web|Sitio web \(URL\)|URL"),
+            ("nombreComercial", "Nombre comercial"), ("nombreProyecto", "Nombre del proyecto"),
+            ("institucionFinanciadora", "Institución financiadora"), ("institucionSolicitante", "Institución solicitante"),
+            ("ambito", "Ambito|Ámbito"), ("objeto", "Objeto"), ("fechaEnvio", "Fecha de envío"),
+            ("ciudad", "Ciudad|Lugar de realización"), ("numeroConsecutivoConcepto", "Número consecutivo del concepto"),
+            ("nit", "NIT"), ("fechaRegistro", "Fecha de registro ante cámara"), ("medioVerificacion", "medio de verificación"),
+            ("tipoLicencia", "Licencia Creative Commons u Open Data Commons del contenido"),
+            ("tipoFormato", "Tipo de formato"), ("medioCirculacion", "Medio de circulación"),
+            ("lugarPublicacion", "Lugar de publicación"), ("idioma", "idioma"),
+            ("medioDivulgacion", "Medio de divulgación"), ("emisora", "Emisora"),
+            ("institucionesParticipanes", "Instituciones participantes|Entidades vinculadas"),
+            ("tipoTaller", "Tipo de taller"), ("participacion", "Participación"),
+            ("fechaInicio", "Fecha de inicio"), ("fechaFinalizacion", "Fecha de finalización"),
+            ("distincionObtenida", "Distinción obtenida"), ("mecanismoSeleccion", "Mecanismo de selección"),
+            ("paginas", r"Nro\. Paginas|Número de páginas|págs|págs\.|Nro\. Páginas"),
+            ("doi", "DOI"), ("baseDatos", "Base de datos donde está incluido el registro"),
+            ("institucionCertificadora", "Institución certificadora"), ("numeroContrato", "Número del contrato"),
+            ("institucionServicio", "Institución en la cual prestó el servicio"), ("duracion", "Duración|Duracion"),
+            ("publicoObjetivo", "público objetivo"), ("generoLiterario", "Género literario"),
+            ("tipoProduccion", "Tipo"), ("tipoCirculacion", "Tipo de circulación"), ("enfoqueDiferencial", "Enfoque diferencial"),
+            ("componenteDigital", "Componente digital"), ("ISBN", "ISBN"), ("volumen", "vol|Volumen"),
+            ("numeroParticipantes", "Número de participantes")
+        ]
+
+        for obj_key, regex_key in known_keys:
+            val = self._extract_kv(raw_html, regex_key)
+            if val:
+                parsed["extra_data"][obj_key] = val
+
+        m_pais = re.search(r'(Colombia|España|Venezuela|México|Mexico|Argentina|Chile|Per[uú]|Ecuador|Brasil|Estados Unidos|USA)\b', full_text_flat, re.IGNORECASE)
+        if m_pais and "pais" not in parsed["extra_data"]:
+            parsed["extra_data"]["pais"] = self._clean_text(m_pais.group(1))
+
+        return parsed
 
 class Command(BaseCommand):
     help = 'Sincroniza los datos de grupos de investigación desde Scienti (Minciencias)'
@@ -122,8 +303,8 @@ class ScientiScraper:
     
     # --- DEBUG SETTINGS ---
     # Set to True to limit the number of processed items for testing
-    DEBUG_MODE = False
-    MAX_DEBUG_ITEMS = 15
+    DEBUG_MODE = True
+    MAX_DEBUG_ITEMS = 5
     # ----------------------
 
     def __init__(self, stdout, style):
@@ -1253,7 +1434,91 @@ class ScientiScraper:
                     relationship_type=inst['relationship']
                 )
 
+
+        # --- NUEVO: Procesamiento de Productos Genéricos (DTeI, PASC, DP) ---
+        self._log("     -> Procesando Productos Genéricos (DTeI, PASC, DP)...")
+        generic_parser = GenericProductParser()
+        generic_data = self._extract_generic_products_from_soup(soup, generic_parser)
+        
+        if self.DEBUG_MODE:
+            self._log(f"        DEBUG: Limitando productos genéricos a {self.MAX_DEBUG_ITEMS}")
+            generic_data = generic_data[:self.MAX_DEBUG_ITEMS]
+
+        for p_data in generic_data:
+            # Build id
+            raw_title = p_data.get("title", "")
+            safe_title = self._normalize_key(raw_title)
+            safe_table = self._normalize_key(p_data.get("table_name", ""))
+            str_year = str(p_data.get("year") or "0")
+            gen_id = f"GEN-{grupo_obj.code}-{safe_table}-{safe_title[:30]}-{str_year}"
+            
+            # Generar hash_id si no cabe
+            import hashlib
+            gen_hash = hashlib.md5(gen_id.encode('utf-8')).hexdigest()[:48]
+
+            # Create or update GenericProduct
+            gen_obj, created = GenericProduct.objects.update_or_create(
+                hash_id=gen_hash,
+                group=grupo_obj,
+                defaults={
+                    "category": p_data["category"],
+                    "table_name": p_data["table_name"],
+                    "title": p_data["title"],
+                    "year": p_data["year"],
+                    "extra_data": p_data["extra_data"]
+                }
+            )
+
+            # Authors Custom Loop
+            processed_aut_ids = []
+            for a_name in p_data["authors"]:
+                aut_obj, _ = GenericProductAuthor.objects.update_or_create(
+                    product=gen_obj,
+                    name=a_name,
+                    defaults={"role": "Author"}
+                )
+                processed_aut_ids.append(aut_obj.id)
+            
+            GenericProductAuthor.objects.filter(product=gen_obj).exclude(id__in=processed_aut_ids).delete()
+
     # --- EXTRACTORS ---
+    def _extract_generic_products_from_soup(self, soup, parser_instance):
+        results = []
+        target_headers = []
+        for h in soup.find_all('td', class_='celdaEncabezado'):
+            txt = re.sub(r'\s+', ' ', h.get_text().strip())
+            if txt in parser_instance.TABLE_CATEGORIES:
+                target_headers.append((h, txt))
+
+        for h, table_name in target_headers:
+            parent_tr = h.find_parent('tr')
+            if not parent_tr: continue
+            siblings = parent_tr.find_next_siblings('tr')
+            for sib in siblings:
+                if sib.find('td', class_='celdaEncabezado'): break
+                tds = sib.find_all('td')
+                content_td = None
+                for td in tds:
+                    txt_strip = td.get_text(strip=True)
+                    if re.match(r'^\s*\d+[\.\-]*\s*', txt_strip) or (td.find('strong') and "Nombre" in td.find('strong').get_text()):
+                        content_td = td
+                        break
+                
+                # If there's no strong or enumeration, we just take the first cell if it has classes like celdas0, celdas1, celdas_1
+                if not content_td:
+                    for td in tds:
+                        td_class = td.get('class', [])
+                        if any('celda' in c for c in td_class) and not 'celdaEncabezado' in td_class:
+                            content_td = td
+                            break
+
+                if not content_td: continue
+
+                # Parse the cell content using our generic rules
+                parsed_dict = parser_instance.parse_cell(table_name, str(content_td))
+                results.append(parsed_dict)
+        return results
+
     def _extract_articles_from_soup(self, soup):
         articles = []
         seen_by_canonical_key = {}
