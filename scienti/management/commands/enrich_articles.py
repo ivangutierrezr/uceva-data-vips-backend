@@ -5,6 +5,24 @@ from django.core.management.base import BaseCommand
 from django.conf import settings
 from scienti.models import Article, ArticleCategory, ArticleCategorySource
 
+# ---------------------------------------------------------------------------
+# Homologation table: Scimago quartiles → Publindex-style letters.
+# The app only shows A1, A2, B, C — Q values are mapped on ingestion.
+# ---------------------------------------------------------------------------
+QUARTILE_TO_LETTER = {
+    'Q1': 'A1',
+    'Q2': 'A2',
+    'Q3': 'B',
+    'Q4': 'C',
+}
+
+def homologate_category(raw: str) -> str:
+    """Normalize a raw category value to A1/A2/B/C when possible."""
+    if not raw:
+        return raw
+    normalized = str(raw).strip().upper()
+    return QUARTILE_TO_LETTER.get(normalized, str(raw).strip())
+
 class Command(BaseCommand):
     help = 'Enrich articles with categories from SCIMago and Publindex'
 
@@ -154,7 +172,7 @@ class Command(BaseCommand):
                     article_id=art['id'],
                     source=source,
                     year=art['year'], # Use the article's year
-                    defaults={'category': str(raw_cat)}
+                    defaults={'category': homologate_category(str(raw_cat))}
                 )
                 matches_count += 1
         

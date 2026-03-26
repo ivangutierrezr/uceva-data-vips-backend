@@ -26,6 +26,7 @@ from scienti.views import (
     get_article_detail,
     get_book_detail,
     get_book_chapter_detail,
+    get_groups_list,
     get_group_detail,
     export_group_detail_excel,
 )
@@ -38,6 +39,7 @@ urlpatterns = [
     path('api/search/', global_search, name='global_search'),
     path('api/researchers/<str:researcher_id>/', get_researcher_detail, name='get_researcher_detail'),
     path('api/researchers/<str:researcher_id>/export/', export_researcher_detail_excel, name='export_researcher_detail_excel'),
+    path('api/groups/', get_groups_list, name='get_groups_list'),
     path('api/groups/<str:group_id>/', get_group_detail, name='get_group_detail'),
     path('api/groups/<str:group_id>/export/', export_group_detail_excel, name='export_group_detail_excel'),
     path('api/articles/<str:article_id>/', get_article_detail, name='get_article_detail'),

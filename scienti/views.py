@@ -2,9 +2,8 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from django.http import HttpResponse
 from django.db import models
-from django.db.models import Count, Q, F, Value
-from django.db.models.functions import ExtractYear
-from django.db.models.functions import Coalesce, Lower
+from django.db.models import Count, Q, F, Value, Subquery, OuterRef, IntegerField
+from django.db.models.functions import ExtractYear, Coalesce, Lower
 from io import BytesIO
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -26,6 +25,8 @@ from .models import (
     ChapterAuthor,
     ThesisTutor,
     ThesisStudent,
+    GenericProduct,
+    GenericProductAuthor,
 )
 from .infrastructure.utils.country_coords import COUNTRY_COORDINATES
 import re
@@ -1144,6 +1145,31 @@ def _build_group_detail_payload(group):
         }
         for t in theses
     ]
+    
+    # Generic Products
+    generic_products = GenericProduct.objects.filter(group=group).order_by('-year', 'title')[:200]
+    generic_ids = [gp.id for gp in generic_products]
+    generic_authors_by_id = {}
+    
+    generic_authors_qs = GenericProductAuthor.objects.filter(product_id__in=generic_ids).values('product_id', 'name').order_by('id')
+    for ga in generic_authors_qs:
+        generic_authors_by_id.setdefault(ga['product_id'], []).append({
+            'name': ga['name'],
+            'isGroupMember': False  # GenericProductAuthor doesn't have researcher yet
+        })
+        
+    generic_products_data = [
+        {
+            'id': str(gp.id),
+            'title': gp.title,
+            'year': gp.year,
+            'category': gp.category,
+            'tableName': gp.table_name,
+            'authors': generic_authors_by_id.get(gp.id, []),
+            'extraData': gp.extra_data,
+        }
+        for gp in generic_products
+    ]
 
     return {
         'id': str(group.id),
@@ -1164,8 +1190,60 @@ def _build_group_detail_payload(group):
             'books': books_data,
             'bookChapters': chapters_data,
             'theses': theses_data,
+            'generic': generic_products_data,
         }
     }
+
+@api_view(['GET'])
+def get_groups_list(request):
+    """
+    Returns all research groups with summary data suitable for listing cards.
+    Uses correlated subqueries instead of a multi-table JOIN to avoid
+    Cartesian-product blowup that caused BufFileRead disk spills.
+    """
+    from .models import Article, Book, BookChapter, Thesis, GroupMember
+
+    def _count_sq(model, fk='group_id'):
+        return Coalesce(
+            Subquery(
+                model.objects
+                    .filter(**{fk: OuterRef('pk')})
+                    .values(fk)
+                    .annotate(c=Count('id'))
+                    .values('c')[:1],
+                output_field=IntegerField(),
+            ),
+            0,
+        )
+
+    groups = (
+        ResearchGroup.objects
+        .only('id', 'name', 'code', 'category', 'leader')
+        .annotate(
+            articles_count=_count_sq(Article),
+            books_count=_count_sq(Book),
+            chapters_count=_count_sq(BookChapter),
+            theses_count=_count_sq(Thesis),
+            researchers_count=_count_sq(GroupMember),
+        )
+        .order_by('name')
+    )
+    data = [
+        {
+            'id': str(g.id),
+            'name': g.name,
+            'code': g.code,
+            'category': g.category,
+            'leader': g.leader,
+            'articles_count': g.articles_count,
+            'books_count': g.books_count,
+            'chapters_count': g.chapters_count,
+            'theses_count': g.theses_count,
+            'researchers_count': g.researchers_count,
+        }
+        for g in groups
+    ]
+    return Response(data)
 
 @api_view(['GET'])
 def get_group_detail(request, group_id):
@@ -1328,6 +1406,24 @@ def export_group_detail_excel(request, group_id):
         ])
     style_table_header(ws_theses, 6)
     auto_fit_columns(ws_theses)
+    
+    ws_generic = workbook.create_sheet('Otros Productos')
+    ws_generic.append(['Título', 'Año', 'Categoría', 'Tipo de Producto', 'Investigadores', 'Detalles Adicionales'])
+    for row in data['products'].get('generic', []):
+        extra_data_str = ", ".join([f"{k}: {v}" for k, v in row.get('extraData', {}).items() if k != 'raw_text'])
+        if not extra_data_str:
+             extra_data_str = row.get('extraData', {}).get('raw_text', '')
+             
+        ws_generic.append([
+            row.get('title') or 'S/T',
+            row.get('year'),
+            row.get('category'),
+            row.get('tableName'),
+            ', '.join([a.get('name', '') for a in row.get('authors', [])]),
+            extra_data_str
+        ])
+    style_table_header(ws_generic, 6)
+    auto_fit_columns(ws_generic)
 
     output = BytesIO()
     workbook.save(output)
@@ -1356,6 +1452,8 @@ def get_stats(request):
     chapters_count = BookChapter.objects.values('chapter_title', 'book_title', 'year').distinct().count()
     books_chapters_count = books_count + chapters_count
     
+    generic_count = GenericProduct.objects.values('title', 'year', 'table_name').distinct().count()
+
     events_count = ScientificEvent.objects.annotate(
         event_year=ExtractYear('start_date')
     ).values('title', 'event_year').distinct().count()
@@ -1435,12 +1533,13 @@ def get_stats(request):
             'breakdown': researcher_breakdown
         },
         { 'label': 'Artículos', 'value': str(articles_count) },
-        { 
-            'label': 'Tesis de Grado', 
+        {
+            'label': 'Tesis de Grado',
             'value': str(theses_count),
-            'breakdown': thesis_breakdown 
+            'breakdown': thesis_breakdown
         },
         { 'label': 'Libros & Capítulos', 'value': str(books_chapters_count) },
+        { 'label': 'Otros Productos (DTeI, DP)', 'value': str(generic_count) },
         {
             'label': 'Eventos Científicos',
             'value': str(events_count),

@@ -1,5 +1,6 @@
 from django.core.management.base import BaseCommand
 from django.db import transaction
+from django.utils import timezone
 from scienti.models import (
     ResearchGroup, Researcher, GroupMember,
     Article, Book, BookChapter, Thesis,
@@ -303,7 +304,7 @@ class ScientiScraper:
     
     # --- DEBUG SETTINGS ---
     # Set to True to limit the number of processed items for testing
-    DEBUG_MODE = True
+    DEBUG_MODE = False
     MAX_DEBUG_ITEMS = 5
     # ----------------------
 
@@ -2299,13 +2300,17 @@ class ScientiScraper:
                     try:
                          # Usually format YYYY-MM-DD HH:MM:SS.0
                          start_date_clean = start_date_str.split()[0] # Take YYYY-MM-DD
-                         start_date = datetime.datetime.strptime(start_date_clean, "%Y-%m-%d")
+                         start_date = timezone.make_aware(
+                             datetime.datetime.strptime(start_date_clean, "%Y-%m-%d")
+                         )
                     except: pass
                 
                 if end_date_str:
                     try:
                          end_date_clean = end_date_str.split()[0]
-                         end_date = datetime.datetime.strptime(end_date_clean, "%Y-%m-%d")
+                         end_date = timezone.make_aware(
+                             datetime.datetime.strptime(end_date_clean, "%Y-%m-%d")
+                         )
                     except: pass
 
                 # Scope and Participation
