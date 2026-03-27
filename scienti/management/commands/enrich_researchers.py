@@ -35,7 +35,32 @@ class Command(BaseCommand):
         'Fallback source: CvLAC page (for researchers not found in datos.gov.co).'
     )
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--with-cvlac',
+            action='store_true',
+            help='Ejecuta tambien el fallback lento contra CvLAC para investigadores sin categoria.',
+        )
+        parser.add_argument(
+            '--cvlac-only',
+            action='store_true',
+            help='Omite datos.gov.co y ejecuta solo el fallback lento contra CvLAC.',
+        )
+        parser.add_argument(
+            '--cvlac-full',
+            action='store_true',
+            help='Ejecuta CvLAC para todos los investigadores con URL y completa informacion faltante sin sobreescribir la categoria ya obtenida desde datos.gov.co.',
+        )
+
     def handle(self, *args, **options):
+        run_cvlac_fallback = options.get('with_cvlac', False)
+        cvlac_only = options.get('cvlac_only', False)
+        cvlac_full = options.get('cvlac_full', False)
+
+        selected_modes = [run_cvlac_fallback, cvlac_only, cvlac_full]
+        if sum(1 for mode in selected_modes if mode) > 1:
+            raise ValueError('Use solo una opcion: --with-cvlac, --cvlac-only o --cvlac-full.')
+
         self.stdout.write(self.style.SUCCESS('Starting researcher enrichment process...'))
 
         all_researchers = list(Researcher.objects.all())
@@ -56,91 +81,119 @@ class Command(BaseCommand):
         errors_count = 0
         enriched_ids: set[str] = set()   # track who got data from step 1
 
-        for i in range(0, len(ids_to_process), batch_size):
-            batch_ids = ids_to_process[i:i + batch_size]
-            quoted_ids = [f"'{pid}'" for pid in batch_ids]
-            id_list_str = ",".join(quoted_ids)
+        if not cvlac_only:
+            for i in range(0, len(ids_to_process), batch_size):
+                batch_ids = ids_to_process[i:i + batch_size]
+                quoted_ids = [f"'{pid}'" for pid in batch_ids]
+                id_list_str = ",".join(quoted_ids)
 
-            query_params = {
-                "$select": "id_persona_pr, nme_clasificacion_pr, nme_niv_form_pr, ano_convo, nme_municipio_res_pr, nme_departamento_res_pr",
-                "$where": f"id_persona_pr in ({id_list_str})",
-                "$order": "ano_convo DESC",
-                "$limit": 5000,
-            }
+                query_params = {
+                    "$select": "id_persona_pr, nme_clasificacion_pr, nme_niv_form_pr, ano_convo, nme_municipio_res_pr, nme_departamento_res_pr",
+                    "$where": f"id_persona_pr in ({id_list_str})",
+                    "$order": "ano_convo DESC",
+                    "$limit": 5000,
+                }
 
-            try:
-                response = requests.get(base_url, params=query_params, timeout=15)
-                response.raise_for_status()
-                data = response.json()
+                try:
+                    response = requests.get(base_url, params=query_params, timeout=15)
+                    response.raise_for_status()
+                    data = response.json()
 
-                processed_in_batch: set[str] = set()
-                for record in data:
-                    remote_id = record.get('id_persona_pr')
-                    if remote_id not in researchers_map or remote_id in processed_in_batch:
-                        continue
+                    processed_in_batch: set[str] = set()
+                    for record in data:
+                        remote_id = record.get('id_persona_pr')
+                        if remote_id not in researchers_map or remote_id in processed_in_batch:
+                            continue
 
-                    researcher = researchers_map[remote_id]
-                    category_raw = record.get('nme_clasificacion_pr')
-                    education_val = record.get('nme_niv_form_pr')
-                    city_val     = record.get('nme_municipio_res_pr')
-                    dept_val     = record.get('nme_departamento_res_pr')
+                        researcher = researchers_map[remote_id]
+                        category_raw = record.get('nme_clasificacion_pr')
+                        education_val = record.get('nme_niv_form_pr')
+                        city_val     = record.get('nme_municipio_res_pr')
+                        dept_val     = record.get('nme_departamento_res_pr')
 
-                    fields: list[str] = []
-                    if category_raw:
-                        normalized = _normalize_category(category_raw)
-                        if researcher.category != normalized:
-                            researcher.category = normalized
-                            fields.append('category')
-                        enriched_ids.add(remote_id)   # found in datos.gov.co
+                        fields: list[str] = []
+                        if category_raw:
+                            normalized = _normalize_category(category_raw)
+                            if researcher.category != normalized:
+                                researcher.category = normalized
+                                fields.append('category')
+                            enriched_ids.add(remote_id)
 
-                    if education_val and researcher.education_level != education_val:
-                        researcher.education_level = education_val
-                        fields.append('education_level')
-                    if city_val and researcher.city != city_val:
-                        researcher.city = city_val
-                        fields.append('city')
-                    if dept_val and researcher.department != dept_val:
-                        researcher.department = dept_val
-                        fields.append('department')
+                        if education_val and researcher.education_level != education_val:
+                            researcher.education_level = education_val
+                            fields.append('education_level')
+                        if city_val and researcher.city != city_val:
+                            researcher.city = city_val
+                            fields.append('city')
+                        if dept_val and researcher.department != dept_val:
+                            researcher.department = dept_val
+                            fields.append('department')
 
-                    if fields:
-                        researcher.save(update_fields=fields)
-                        updated_count += 1
-                        if updated_count % 10 == 0:
-                            self.stdout.write(
-                                f"Updated: {researcher.name} -> {researcher.category} | {education_val}"
-                            )
+                        if fields:
+                            researcher.save(update_fields=fields)
+                            updated_count += 1
+                            if updated_count % 10 == 0:
+                                self.stdout.write(
+                                    f"Updated: {researcher.name} -> {researcher.category} | {education_val}"
+                                )
 
-                    processed_in_batch.add(remote_id)
+                        processed_in_batch.add(remote_id)
 
-                time.sleep(0.5)
+                    time.sleep(0.5)
 
-            except Exception as e:
-                self.stdout.write(self.style.ERROR(f"Error in batch {i}: {e}"))
-                errors_count += 1
+                except Exception as e:
+                    self.stdout.write(self.style.ERROR(f"Error in batch {i}: {e}"))
+                    errors_count += 1
 
-        self.stdout.write(
-            self.style.SUCCESS(
-                f'Step 1 (datos.gov.co) completed. Updated: {updated_count}. Errors: {errors_count}'
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f'Step 1 (datos.gov.co) completed. Updated: {updated_count}. Errors: {errors_count}'
+                )
             )
-        )
+        else:
+            self.stdout.write('Skipping Step 1 (datos.gov.co) because --cvlac-only was requested.')
 
         # ------------------------------------------------------------------ #
         # STEP 2 — CvLAC fallback — historical source for gaps               #
-        # Only runs for researchers that still have no category after step 1. #
+        # By default it only runs for researchers still missing category.     #
+        # In full mode it iterates all researchers with CvLAC URL and fills   #
+        # only missing fields, preserving datos.gov.co as source of truth.    #
         # ------------------------------------------------------------------ #
-        missing = [
-            r for r in all_researchers
-            if not r.category and r.cvlac_url
-        ]
-        self.stdout.write(
-            f"Step 2 (CvLAC fallback): {len(missing)} researchers still missing category."
-        )
+        if not run_cvlac_fallback and not cvlac_only and not cvlac_full:
+            remaining_missing = [
+                r for r in all_researchers
+                if not r.category and r.cvlac_url
+            ]
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Skipping Step 2 (CvLAC fallback). {len(remaining_missing)} researchers still missing category can be enriched later with: python manage.py enrich_researchers --with-cvlac"
+                )
+            )
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f'Process completed. Total updated: {updated_count}.'
+                )
+            )
+            return
+        if cvlac_full:
+            candidates = [r for r in all_researchers if r.cvlac_url]
+            self.stdout.write(
+                f"Step 2 (CvLAC full): {len(candidates)} researchers with CvLAC URL will be checked."
+            )
+        else:
+            candidates = [
+                r for r in all_researchers
+                if not r.category and r.cvlac_url
+            ]
+            self.stdout.write(
+                f"Step 2 (CvLAC fallback): {len(candidates)} researchers still missing category."
+            )
 
         cvlac_updated = 0
         cvlac_errors  = 0
+        total_candidates = len(candidates)
 
-        for researcher in missing:
+        for index, researcher in enumerate(candidates, start=1):
             try:
                 resp = requests.get(researcher.cvlac_url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
                 resp.raise_for_status()
@@ -150,7 +203,7 @@ class Command(BaseCommand):
                 education_val  = self._cvlac_education(soup)
 
                 fields: list[str] = []
-                if category_val:
+                if category_val and not researcher.category:
                     normalized = _normalize_category(category_val)
                     if researcher.category != normalized:
                         researcher.category = normalized
@@ -163,14 +216,22 @@ class Command(BaseCommand):
                     researcher.save(update_fields=fields)
                     cvlac_updated += 1
                     self.stdout.write(
-                        f"  [CvLAC] {researcher.name} -> {researcher.category} | {researcher.education_level}"
+                        f"  [CvLAC {index}/{total_candidates}] {researcher.name} -> {researcher.category} | {researcher.education_level}"
+                    )
+                else:
+                    self.stdout.write(
+                        f"  [CvLAC {index}/{total_candidates}] {researcher.name} -> sin cambios"
                     )
 
                 time.sleep(0.3)
 
             except Exception as e:
                 cvlac_errors += 1
-                self.stdout.write(self.style.WARNING(f"  [CvLAC] Error for {researcher.name}: {e}"))
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"  [CvLAC {index}/{total_candidates}] Error for {researcher.name}: {e}"
+                    )
+                )
 
         self.stdout.write(
             self.style.SUCCESS(

@@ -8,6 +8,8 @@ from io import BytesIO
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import quote_sheetname
+from openpyxl.worksheet.hyperlink import Hyperlink
 from django.utils import timezone
 from .models import (
     Researcher,
@@ -25,8 +27,10 @@ from .models import (
     ChapterAuthor,
     ThesisTutor,
     ThesisStudent,
+    EventInstitution,
     GenericProduct,
     GenericProductAuthor,
+    GroupMember,
 )
 from .infrastructure.utils.country_coords import COUNTRY_COORDINATES
 import re
@@ -44,10 +48,96 @@ def normalize_identifier(value):
     return re.sub(r'[^a-z0-9]', '', remove_accents(value).lower())
 
 
+def normalize_country_key(value):
+    if not value:
+        return ""
+    normalized = remove_accents(value).lower()
+    normalized = re.sub(r'[^a-z0-9]+', ' ', normalized)
+    return re.sub(r'\s+', ' ', normalized).strip()
+
+
 def normalize_doi(value):
     if not value:
         return ""
     return normalize_identifier(value)
+
+
+COUNTRY_ALIAS_GROUPS = {
+    'estados unidos': {
+        'estados unidos',
+        'estados unidos de america',
+        'usa',
+        'u s a',
+        'eeuu',
+        'ee uu',
+        'ee.uu',
+        'united states',
+        'us',
+    },
+    'reino unido': {
+        'reino unido',
+        'inglaterra',
+        'united kingdom',
+        'uk',
+        'great britain',
+        'britain',
+        'gran bretana',
+    },
+}
+
+COUNTRY_CANONICAL_DISPLAY_NAMES = {
+    'estados unidos': 'Estados Unidos',
+    'reino unido': 'Reino Unido',
+}
+
+COUNTRY_ALIAS_LOOKUP = {
+    normalize_country_key(alias): canonical_key
+    for canonical_key, aliases in COUNTRY_ALIAS_GROUPS.items()
+    for alias in aliases
+}
+
+
+def canonicalize_country_name(value):
+    normalized_key = normalize_country_key(value)
+    return COUNTRY_ALIAS_LOOKUP.get(normalized_key, normalized_key)
+
+
+def get_country_display_name(value):
+    canonical_key = canonicalize_country_name(value)
+    return COUNTRY_CANONICAL_DISPLAY_NAMES.get(canonical_key, (value or '').title())
+
+
+def resolve_country_group(country_id):
+    raw_value = (country_id or '').strip()
+    all_countries = list(Country.objects.all())
+
+    try:
+        import uuid
+        uuid_obj = uuid.UUID(raw_value)
+        country = next((item for item in all_countries if item.id == uuid_obj), None)
+        if country:
+            canonical_key = canonicalize_country_name(country.name)
+            matched = [item for item in all_countries if canonicalize_country_name(item.name) == canonical_key]
+            return matched, COUNTRY_CANONICAL_DISPLAY_NAMES.get(canonical_key, country.name.title()), canonical_key
+    except (ValueError, TypeError):
+        pass
+
+    normalized_input = canonicalize_country_name(raw_value.replace('-', ' '))
+    if not normalized_input:
+        return [], None, None
+
+    matched = [item for item in all_countries if canonicalize_country_name(item.name) == normalized_input]
+    if matched:
+        return matched, COUNTRY_CANONICAL_DISPLAY_NAMES.get(normalized_input, matched[0].name.title()), normalized_input
+
+    if len(normalized_input) > 3:
+        for country in all_countries:
+            country_key = canonicalize_country_name(country.name)
+            if normalized_input in country_key or country_key in normalized_input:
+                matched = [item for item in all_countries if canonicalize_country_name(item.name) == country_key]
+                return matched, COUNTRY_CANONICAL_DISPLAY_NAMES.get(country_key, country.name.title()), country_key
+
+    return [], None, normalized_input
 
 
 ACCENTED_CHARS = 'áàäâãéèëêíìïîóòöôõúùüûñç'
@@ -78,6 +168,196 @@ def unique_by_id(items):
         seen.add(item_id)
         unique_items.append(item)
     return unique_items
+
+
+def serialize_optional_datetime(value):
+    if not value:
+        return None
+    localized = timezone.localtime(value) if timezone.is_aware(value) else value
+    return localized.date().isoformat()
+
+
+GENERIC_EXTRA_DATA_PREFERRED_KEYS = (
+    'tipo',
+    'ciudad',
+    'pais',
+    'ambito',
+    'disponibilidad',
+    'idioma',
+    'institucionSolicitante',
+    'institucionServicio',
+    'institucionFinanciadora',
+    'fechaEnvio',
+    'mes',
+    'numeroConsecutivoConcepto',
+    'numeroContrato',
+)
+
+
+def humanize_extra_data_key(value):
+    labels = {
+        'tipo': 'Tipo',
+        'ciudad': 'Ciudad',
+        'pais': 'País',
+        'ambito': 'Ámbito',
+        'disponibilidad': 'Disponibilidad',
+        'idioma': 'Idioma',
+        'fechaEnvio': 'Fecha de envío',
+        'mes': 'Mes',
+        'numeroContrato': 'Número de contrato',
+        'numeroConsecutivoConcepto': 'Número consecutivo',
+        'institucionSolicitante': 'Institución solicitante',
+        'institucionServicio': 'Institución de servicio',
+        'institucionFinanciadora': 'Institución financiadora',
+    }
+    if value in labels:
+        return labels[value]
+    return re.sub(r'(?<!^)([A-Z])', r' \1', str(value or '').replace('_', ' ')).strip().capitalize()
+
+
+def stringify_extra_data_value(value):
+    if value is None:
+        return ''
+    if isinstance(value, bool):
+        return 'Sí' if value else 'No'
+    if isinstance(value, (list, tuple, set)):
+        return ', '.join([stringify_extra_data_value(item) for item in value if item not in (None, '')])
+    if isinstance(value, dict):
+        return '; '.join(
+            f"{humanize_extra_data_key(key)}: {stringify_extra_data_value(item)}"
+            for key, item in value.items()
+            if item not in (None, '')
+        )
+    return str(value).strip().rstrip(':;,')
+
+
+def ordered_generic_extra_data_keys(rows):
+    keys = set()
+    for row in rows:
+        extra_data = row.get('extraData') or {}
+        if not isinstance(extra_data, dict):
+            continue
+        for key, value in extra_data.items():
+            if key == 'raw_text' or value in (None, ''):
+                continue
+            keys.add(key)
+
+    def sort_key(key):
+        try:
+            return (0, GENERIC_EXTRA_DATA_PREFERRED_KEYS.index(key))
+        except ValueError:
+            return (1, humanize_extra_data_key(key).lower())
+
+    return sorted(keys, key=sort_key)
+
+
+def parse_optional_year_param(value):
+    if value in (None, ''):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_event_year_from_payload(item):
+    source = item.get('startDate') or item.get('endDate')
+    if not source:
+        return None
+    try:
+        return int(str(source)[:4])
+    except (TypeError, ValueError):
+        return None
+
+
+def within_year_range(year, from_year=None, to_year=None):
+    if not from_year and not to_year:
+        return True
+    if not year:
+        return False
+    if from_year and year < from_year:
+        return False
+    if to_year and year > to_year:
+        return False
+    return True
+
+
+def filter_products_payload_by_year_range(products, from_year=None, to_year=None):
+    if not from_year and not to_year:
+        return products
+
+    return {
+        **products,
+        'articles': [
+            item for item in products.get('articles', [])
+            if within_year_range(item.get('year'), from_year, to_year)
+        ],
+        'books': [
+            item for item in products.get('books', [])
+            if within_year_range(item.get('year'), from_year, to_year)
+        ],
+        'bookChapters': [
+            item for item in products.get('bookChapters', [])
+            if within_year_range(item.get('year'), from_year, to_year)
+        ],
+        'theses': [
+            item for item in products.get('theses', [])
+            if within_year_range(item.get('year'), from_year, to_year)
+        ],
+        'events': [
+            item for item in products.get('events', [])
+            if within_year_range(get_event_year_from_payload(item), from_year, to_year)
+        ],
+        'generic': [
+            item for item in products.get('generic', [])
+            if within_year_range(item.get('year'), from_year, to_year)
+        ],
+    }
+
+
+def get_available_years_from_products(products):
+    years = set()
+    current_year = timezone.localtime().year
+
+    def register_year(value):
+        if not value:
+            return
+        if 1900 <= value <= current_year + 1:
+            years.add(value)
+
+    for item in products.get('articles', []):
+        register_year(item.get('year'))
+    for item in products.get('books', []):
+        register_year(item.get('year'))
+    for item in products.get('bookChapters', []):
+        register_year(item.get('year'))
+    for item in products.get('theses', []):
+        register_year(item.get('year'))
+    for item in products.get('events', []):
+        register_year(get_event_year_from_payload(item))
+    for item in products.get('generic', []):
+        register_year(item.get('year'))
+    return sorted(years, reverse=True)
+
+
+def filter_group_detail_payload_by_year_range(data, from_year=None, to_year=None):
+    if not from_year and not to_year:
+        return data
+
+    return {
+        **data,
+        'products': filter_products_payload_by_year_range(data['products'], from_year, to_year),
+    }
+
+
+def describe_export_year_filter(from_year=None, to_year=None):
+    if not from_year and not to_year:
+        return 'Todos los años'
+    if from_year and to_year:
+        return f'Desde {from_year} hasta {to_year}'
+    if from_year:
+        return f'Desde {from_year} hasta el presente'
+    return f'Desde el año más antiguo hasta {to_year}'
 
 
 def _normalize_text_key(value):
@@ -387,7 +667,7 @@ def _build_researcher_detail_payload(researcher):
 
     article_categories_by_id = {}
     article_categories_qs = (
-        ArticleCategory.objects.filter(article_id__in=article_ids)
+        ArticleCategory.objects.filter(article_id__in=article_ids, source__name__iexact='PUBLINDEX')
         .select_related('source')
         .values('article_id', 'year', 'category', 'source__name')
     )
@@ -408,30 +688,12 @@ def _build_researcher_detail_payload(researcher):
             if filtered:
                 rows = filtered
 
-        by_source = {}
-        for row in rows:
-            source_name = (row.get('source__name') or '').upper().strip() or 'OTRA FUENTE'
-            current = by_source.get(source_name)
-            if not current or (row.get('year') or 0) >= (current.get('year') or 0):
-                by_source[source_name] = row
-
-        selected = None
-        selected_source = None
-
-        publindex_row = by_source.get('PUBLINDEX')
-        scimago_row = by_source.get('SCIMAGO')
-
-        if publindex_row and publindex_row.get('category'):
-            selected = publindex_row.get('category')
-            selected_source = 'Publindex'
-        elif scimago_row and scimago_row.get('category'):
-            selected = scimago_row.get('category')
-            selected_source = 'Scimago'
-
-        if selected:
+        publindex_rows = [row for row in rows if row.get('category')]
+        if publindex_rows:
+            selected = max(publindex_rows, key=lambda row: row.get('year') or 0)
             return {
-                'category': str(selected),
-                'source': selected_source,
+                'category': str(selected.get('category')),
+                'source': 'Publindex',
             }
 
         return {
@@ -989,7 +1251,7 @@ def _build_group_detail_payload(group):
     
     article_categories_by_id = {}
     article_categories_qs = (
-        ArticleCategory.objects.filter(article_id__in=article_ids)
+        ArticleCategory.objects.filter(article_id__in=article_ids, source__name__iexact='PUBLINDEX')
         .select_related('source')
         .values('article_id', 'year', 'category', 'source__name')
     )
@@ -1010,31 +1272,18 @@ def _build_group_detail_payload(group):
             if filtered:
                 rows = filtered
 
-        by_source = {}
-        for row in rows:
-            source_name = (row.get('source__name') or '').upper().strip() or 'OTRA FUENTE'
-            current = by_source.get(source_name)
-            if not current or (row.get('year') or 0) >= (current.get('year') or 0):
-                by_source[source_name] = row
-
-        selected = None
-        selected_source = None
-
-        publindex_row = by_source.get('PUBLINDEX')
-        scimago_row = by_source.get('SCIMAGO')
-
-        if publindex_row and publindex_row.get('category'):
-            selected = publindex_row.get('category')
-            selected_source = 'Publindex'
-        elif scimago_row and scimago_row.get('category'):
-            selected = scimago_row.get('category')
-            selected_source = 'Scimago'
-
-        if selected:
+        publindex_rows = [row for row in rows if row.get('category')]
+        if publindex_rows:
+            selected = max(publindex_rows, key=lambda row: row.get('year') or 0)
             return {
-                'category': str(selected),
-                'source': selected_source,
+                'category': str(selected.get('category')),
+                'source': 'Publindex',
             }
+
+        return {
+            'category': 'N/R',
+            'source': None,
+        }
 
         return {
             'category': 'N/R',
@@ -1145,6 +1394,32 @@ def _build_group_detail_payload(group):
         }
         for t in theses
     ]
+
+    # Scientific events
+    events = ScientificEvent.objects.filter(group=group).order_by('-start_date', 'title')[:200]
+    event_ids = [event.id for event in events]
+    institutions_by_event_id = {}
+    institutions_qs = EventInstitution.objects.filter(event_id__in=event_ids).values('event_id', 'institution_name').order_by('id')
+    for institution in institutions_qs:
+        if not institution['institution_name']:
+            continue
+        institutions_by_event_id.setdefault(institution['event_id'], []).append(institution['institution_name'])
+
+    events_data = [
+        {
+            'id': str(event.id),
+            'title': event.title,
+            'eventType': event.event_type,
+            'scope': event.scope,
+            'participationType': event.participation_type,
+            'city': event.city_obj.name if event.city_obj else event.city,
+            'country': event.country_obj.name if event.country_obj else None,
+            'startDate': serialize_optional_datetime(event.start_date),
+            'endDate': serialize_optional_datetime(event.end_date),
+            'institutions': institutions_by_event_id.get(event.id, []),
+        }
+        for event in events
+    ]
     
     # Generic Products
     generic_products = GenericProduct.objects.filter(group=group).order_by('-year', 'title')[:200]
@@ -1176,6 +1451,7 @@ def _build_group_detail_payload(group):
         'code': group.code,
         'name': group.name,
         'leader': group.leader,
+        'gruplacUrl': group.gruplac_url,
         'category': group.category,
         'formationDateInfo': group.formation_date_info,
         'department': group.department,
@@ -1190,9 +1466,556 @@ def _build_group_detail_payload(group):
             'books': books_data,
             'bookChapters': chapters_data,
             'theses': theses_data,
+            'events': events_data,
             'generic': generic_products_data,
         }
     }
+
+
+def _build_typologies_payload(from_year=None, to_year=None):
+    articles = list(Article.objects.select_related('group').order_by('-year', 'title'))
+    article_ids = [article.id for article in articles]
+
+    article_categories_by_id = {}
+    article_categories_qs = (
+        ArticleCategory.objects.filter(article_id__in=article_ids)
+        .select_related('source')
+        .values('article_id', 'year', 'category', 'source__name')
+    )
+    for row in article_categories_qs:
+        article_categories_by_id.setdefault(row['article_id'], []).append(row)
+
+    def resolve_article_category(article):
+        rows = article_categories_by_id.get(article.id, [])
+        if not rows:
+            return {'category': 'N/R', 'source': None}
+
+        target_year = article.year
+        if target_year is not None:
+            same_year_rows = [row for row in rows if row.get('year') == target_year]
+            if same_year_rows:
+                rows = same_year_rows
+
+        publindex_rows = [row for row in rows if row.get('category')]
+        if publindex_rows:
+            selected = max(publindex_rows, key=lambda row: row.get('year') or 0)
+            return {'category': str(selected['category']), 'source': 'Publindex'}
+        return {'category': 'N/R', 'source': None}
+
+    article_authors_by_id = {}
+    article_authors_qs = ArticleAuthor.objects.filter(article_id__in=article_ids).values('article_id', 'author_name', 'researcher_id').order_by('order')
+    for row in article_authors_qs:
+        article_authors_by_id.setdefault(row['article_id'], []).append({
+            'name': row['author_name'],
+            'researcherPath': f"/investigadores/{row['researcher_id']}" if row.get('researcher_id') else None,
+        })
+
+    articles_data = []
+    for article in articles:
+        resolved_category = resolve_article_category(article)
+        articles_data.append({
+            'id': str(article.id),
+            'title': article.title,
+            'year': article.year,
+            'category': resolved_category['category'],
+            'categorySource': resolved_category['source'],
+            'doi': article.doi,
+            'issn': article.issn,
+            'authors': article_authors_by_id.get(article.id, []),
+            'detailPath': f'/articulos/{article.id}',
+            'group': {
+                'id': str(article.group.id),
+                'name': article.group.name,
+                'code': article.group.code,
+                'category': article.group.category,
+                'detailPath': f'/groups/{article.group.id}',
+            } if article.group else None,
+        })
+
+    books = list(Book.objects.select_related('group').order_by('-year', 'title'))
+    book_ids = [book.id for book in books]
+    book_authors_by_id = {}
+    book_authors_qs = BookAuthor.objects.filter(book_id__in=book_ids).values('book_id', 'author_name', 'researcher_id').order_by('order')
+    for row in book_authors_qs:
+        book_authors_by_id.setdefault(row['book_id'], []).append({
+            'name': row['author_name'],
+            'researcherPath': f"/investigadores/{row['researcher_id']}" if row.get('researcher_id') else None,
+        })
+
+    books_data = [
+        {
+            'id': str(book.id),
+            'title': book.title,
+            'year': book.year,
+            'isbn': book.isbn,
+            'authors': book_authors_by_id.get(book.id, []),
+            'detailPath': f'/libros/{book.id}',
+            'group': {
+                'id': str(book.group.id),
+                'name': book.group.name,
+                'code': book.group.code,
+                'category': book.group.category,
+                'detailPath': f'/groups/{book.group.id}',
+            } if book.group else None,
+        }
+        for book in books
+    ]
+
+    chapters = list(BookChapter.objects.select_related('group').order_by('-year', 'chapter_title'))
+    chapter_ids = [chapter.id for chapter in chapters]
+    chapter_authors_by_id = {}
+    chapter_authors_qs = ChapterAuthor.objects.filter(chapter_id__in=chapter_ids).values('chapter_id', 'author_name', 'researcher_id').order_by('order')
+    for row in chapter_authors_qs:
+        chapter_authors_by_id.setdefault(row['chapter_id'], []).append({
+            'name': row['author_name'],
+            'researcherPath': f"/investigadores/{row['researcher_id']}" if row.get('researcher_id') else None,
+        })
+
+    chapters_data = [
+        {
+            'id': str(chapter.id),
+            'chapterTitle': chapter.chapter_title,
+            'bookTitle': chapter.book_title,
+            'year': chapter.year,
+            'isbn': chapter.isbn,
+            'authors': chapter_authors_by_id.get(chapter.id, []),
+            'detailPath': f'/capitulos/{chapter.id}',
+            'group': {
+                'id': str(chapter.group.id),
+                'name': chapter.group.name,
+                'code': chapter.group.code,
+                'category': chapter.group.category,
+                'detailPath': f'/groups/{chapter.group.id}',
+            } if chapter.group else None,
+        }
+        for chapter in chapters
+    ]
+
+    theses = list(Thesis.objects.select_related('group', 'institution_obj').order_by('-year', 'title'))
+    thesis_ids = [thesis.id for thesis in theses]
+    thesis_authors_by_id = {}
+    tutors_qs = ThesisTutor.objects.filter(thesis_id__in=thesis_ids).values('thesis_id', 'tutor_name', 'researcher_id').order_by('order')
+    for row in tutors_qs:
+        thesis_authors_by_id.setdefault(row['thesis_id'], []).append({
+            'name': row['tutor_name'],
+            'role': 'Tutor/Director',
+            'researcherPath': f"/investigadores/{row['researcher_id']}" if row.get('researcher_id') else None,
+        })
+    students_qs = ThesisStudent.objects.filter(thesis_id__in=thesis_ids).values('thesis_id', 'student_name', 'researcher_id').order_by('order')
+    for row in students_qs:
+        thesis_authors_by_id.setdefault(row['thesis_id'], []).append({
+            'name': row['student_name'],
+            'role': 'Estudiante',
+            'researcherPath': f"/investigadores/{row['researcher_id']}" if row.get('researcher_id') else None,
+        })
+
+    theses_data = [
+        {
+            'id': str(thesis.id),
+            'title': thesis.title,
+            'year': thesis.year,
+            'thesisType': thesis.thesis_type,
+            'institution': thesis.institution_obj.name if thesis.institution_obj else thesis.institution,
+            'authors': thesis_authors_by_id.get(thesis.id, []),
+            'group': {
+                'id': str(thesis.group.id),
+                'name': thesis.group.name,
+                'code': thesis.group.code,
+                'category': thesis.group.category,
+                'detailPath': f'/groups/{thesis.group.id}',
+            } if thesis.group else None,
+        }
+        for thesis in theses
+    ]
+
+    events = list(ScientificEvent.objects.select_related('group', 'city_obj', 'country_obj').order_by('-start_date', 'title'))
+    event_ids = [event.id for event in events]
+    institutions_by_event_id = {}
+    institutions_qs = EventInstitution.objects.filter(event_id__in=event_ids).values('event_id', 'institution_name').order_by('id')
+    for row in institutions_qs:
+        if not row.get('institution_name'):
+            continue
+        institutions_by_event_id.setdefault(row['event_id'], []).append(row['institution_name'])
+
+    events_data = [
+        {
+            'id': str(event.id),
+            'title': event.title,
+            'eventType': event.event_type,
+            'scope': event.scope,
+            'participationType': event.participation_type,
+            'city': event.city_obj.name if event.city_obj else event.city,
+            'country': event.country_obj.name if event.country_obj else None,
+            'startDate': serialize_optional_datetime(event.start_date),
+            'endDate': serialize_optional_datetime(event.end_date),
+            'institutions': institutions_by_event_id.get(event.id, []),
+            'group': {
+                'id': str(event.group.id),
+                'name': event.group.name,
+                'code': event.group.code,
+                'category': event.group.category,
+                'detailPath': f'/groups/{event.group.id}',
+            } if event.group else None,
+        }
+        for event in events
+    ]
+
+    generic_products = list(GenericProduct.objects.select_related('group').order_by('-year', 'title'))
+    generic_ids = [product.id for product in generic_products]
+    generic_authors_by_id = {}
+    generic_authors_qs = GenericProductAuthor.objects.filter(product_id__in=generic_ids).values('product_id', 'name').order_by('id')
+    for row in generic_authors_qs:
+        generic_authors_by_id.setdefault(row['product_id'], []).append({'name': row['name']})
+
+    generic_products_data = [
+        {
+            'id': str(product.id),
+            'title': product.title,
+            'year': product.year,
+            'category': product.category,
+            'tableName': product.table_name,
+            'authors': generic_authors_by_id.get(product.id, []),
+            'extraData': product.extra_data,
+            'group': {
+                'id': str(product.group.id),
+                'name': product.group.name,
+                'code': product.group.code,
+                'category': product.group.category,
+                'detailPath': f'/groups/{product.group.id}',
+            } if product.group else None,
+        }
+        for product in generic_products
+    ]
+
+    products = {
+        'articles': articles_data,
+        'books': books_data,
+        'bookChapters': chapters_data,
+        'theses': theses_data,
+        'events': events_data,
+        'generic': generic_products_data,
+    }
+
+    return {
+        'availableYears': get_available_years_from_products(products),
+        'periodLabel': describe_export_year_filter(from_year, to_year),
+        'products': filter_products_payload_by_year_range(products, from_year, to_year),
+    }
+
+
+@api_view(['GET'])
+def get_typologies_overview(request):
+    from_year = parse_optional_year_param(request.GET.get('fromYear'))
+    to_year = parse_optional_year_param(request.GET.get('toYear'))
+    if from_year and to_year and from_year > to_year:
+        to_year = None
+
+    return Response(_build_typologies_payload(from_year, to_year))
+
+
+@api_view(['GET'])
+def export_typologies_excel(request):
+    from_year = parse_optional_year_param(request.GET.get('fromYear'))
+    to_year = parse_optional_year_param(request.GET.get('toYear'))
+    if from_year and to_year and from_year > to_year:
+        to_year = None
+
+    data = _build_typologies_payload(from_year, to_year)
+    products = data['products']
+
+    workbook = Workbook()
+    default_sheet = workbook.active
+    workbook.remove(default_sheet)
+
+    header_fill = PatternFill(start_color='184336', end_color='184336', fill_type='solid')
+    header_font = Font(color='FFFFFF', bold=True)
+    title_font = Font(size=18, bold=True, color='184336')
+    thin_border = Border(
+        left=Side(style='thin', color='D1D5DB'),
+        right=Side(style='thin', color='D1D5DB'),
+        top=Side(style='thin', color='D1D5DB'),
+        bottom=Side(style='thin', color='D1D5DB'),
+    )
+
+    def style_table_header(sheet, total_columns):
+        for col_idx in range(1, total_columns + 1):
+            cell = sheet.cell(row=1, column=col_idx)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            cell.border = thin_border
+        sheet.freeze_panes = 'A2'
+
+    def style_table_body(sheet):
+        for row in sheet.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
+                cell.border = thin_border
+
+    def auto_fit_columns(sheet, min_width=12, max_width=60):
+        for col_cells in sheet.columns:
+            max_len = 0
+            col_letter = get_column_letter(col_cells[0].column)
+            for cell in col_cells:
+                max_len = max(max_len, len('' if cell.value is None else str(cell.value)))
+            sheet.column_dimensions[col_letter].width = max(min(max_len + 2, max_width), min_width)
+
+    def build_table_sheet(sheet_name, headers, rows, index=None):
+        sheet = workbook.create_sheet(sheet_name, index) if index is not None else workbook.create_sheet(sheet_name)
+        sheet.append(headers)
+        for row in rows:
+            sheet.append(row)
+        style_table_header(sheet, len(headers))
+        style_table_body(sheet)
+        auto_fit_columns(sheet)
+        return sheet
+
+    def normalize_export_value(value, fallback='N/A'):
+        if value is None:
+            return fallback
+        if isinstance(value, str):
+            cleaned = value.strip()
+            return cleaned if cleaned else fallback
+        return value
+
+    def join_authors(authors, include_roles=False):
+        entries = []
+        for author in authors or []:
+            name = (author.get('name') or '').strip()
+            role = (author.get('role') or '').strip()
+            if not name and not role:
+                continue
+            entries.append(f"{name} - {role}".strip(' -') if include_roles and role else (name or role))
+        return '\n'.join(entries) if entries else 'N/A'
+
+    def count_by_label(items, label_getter, empty_label='Sin clasificar'):
+        counts = {}
+        for item in items:
+            label = normalize_export_value(label_getter(item), empty_label)
+            counts[label] = counts.get(label, 0) + 1
+        return sorted(counts.items(), key=lambda entry: (-entry[1], entry[0]))
+
+    def add_summary_links(sheet):
+        for row in sheet.iter_rows(min_row=2):
+            target_sheet = row[3].value
+            if not target_sheet or target_sheet not in workbook.sheetnames:
+                continue
+            row[3].hyperlink = Hyperlink(
+                ref=row[3].coordinate,
+                location=f"{quote_sheetname(target_sheet)}!A1",
+                display=str(row[3].value),
+            )
+            row[3].font = Font(color='0563C1', underline='single', bold=(row[1].value == 'Total tipología'))
+
+    cover_sheet = workbook.create_sheet('Portada', 0)
+    cover_sheet.merge_cells('A1:E1')
+    cover_sheet['A1'] = 'Panorama General de Tipologías'
+    cover_sheet['A1'].font = title_font
+    cover_sheet['A1'].alignment = Alignment(horizontal='center', vertical='center')
+
+    cover_sheet['A3'] = 'Alcance'
+    cover_sheet['B3'] = 'Todos los grupos con producción registrada'
+    cover_sheet['A4'] = 'Periodo exportado'
+    cover_sheet['B4'] = data['periodLabel']
+    cover_sheet['A5'] = 'Fecha de generación'
+    cover_sheet['B5'] = timezone.localtime().strftime('%Y-%m-%d %H:%M')
+
+    overview_rows = [
+        ('Nuevo conocimiento', len(products['articles']) + len(products['books']) + len(products['bookChapters'])),
+        ('Formación RH', len(products['theses'])),
+        ('Eventos científicos', len(products.get('events', []))),
+        ('DTeI', sum(1 for item in products.get('generic', []) if item.get('category') == 'DTeI')),
+        ('PASC', sum(1 for item in products.get('generic', []) if item.get('category') == 'PASC')),
+        ('DP', sum(1 for item in products.get('generic', []) if item.get('category') == 'DP')),
+    ]
+    cover_sheet['D3'] = 'Totales visibles'
+    cover_sheet['D3'].font = Font(bold=True, color='184336')
+    for row_index, (label, value) in enumerate(overview_rows, start=4):
+        cover_sheet[f'D{row_index}'] = label
+        cover_sheet[f'E{row_index}'] = value
+        for cell in (cover_sheet[f'D{row_index}'], cover_sheet[f'E{row_index}']):
+            cell.border = thin_border
+        cover_sheet[f'D{row_index}'].font = Font(bold=True, color='184336')
+        cover_sheet[f'D{row_index}'].fill = PatternFill(start_color='E6F1EE', end_color='E6F1EE', fill_type='solid')
+        cover_sheet[f'D{row_index}'].alignment = Alignment(horizontal='left', vertical='center')
+        cover_sheet[f'E{row_index}'].alignment = Alignment(horizontal='center', vertical='center')
+
+    for row in range(3, 6):
+        cover_sheet[f'A{row}'].font = Font(bold=True, color='184336')
+        cover_sheet[f'A{row}'].fill = PatternFill(start_color='E6F1EE', end_color='E6F1EE', fill_type='solid')
+        cover_sheet[f'A{row}'].alignment = Alignment(horizontal='left', vertical='center')
+        cover_sheet[f'A{row}'].border = thin_border
+        cover_sheet[f'B{row}'].alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+        cover_sheet[f'B{row}'].border = thin_border
+
+    cover_sheet.column_dimensions['A'].width = 24
+    cover_sheet.column_dimensions['B'].width = 50
+    cover_sheet.column_dimensions['D'].width = 28
+    cover_sheet.column_dimensions['E'].width = 16
+
+    summary_sheet_rows = [
+        ['Nuevo conocimiento', 'Total tipología', len(products['articles']) + len(products['books']) + len(products['bookChapters']), 'Nuevo conocimiento'],
+        ['Nuevo conocimiento', 'Artículos', len(products['articles']), 'Nuevo conocimiento'],
+        ['Nuevo conocimiento', 'Libros', len(products['books']), 'Nuevo conocimiento'],
+        ['Nuevo conocimiento', 'Capítulos de libro', len(products['bookChapters']), 'Nuevo conocimiento'],
+        ['Formación RH', 'Total tipología', len(products['theses']), 'Formación RH'],
+        *[['Formación RH', subtype, total, 'Formación RH'] for subtype, total in count_by_label(products['theses'], lambda item: item.get('thesisType'))],
+        ['Eventos científicos', 'Total tipología', len(products.get('events', [])), 'Eventos científicos'],
+        *[['Eventos científicos', subtype, total, 'Eventos científicos'] for subtype, total in count_by_label(products.get('events', []), lambda item: item.get('eventType'))],
+    ]
+    for category in ('DTeI', 'PASC', 'DP'):
+        category_rows = [item for item in products.get('generic', []) if item.get('category') == category]
+        summary_sheet_rows.append([category, 'Total tipología', len(category_rows), category])
+        summary_sheet_rows.extend([
+            [category, subtype, total, category]
+            for subtype, total in count_by_label(category_rows, lambda item: item.get('tableName'), 'Otros productos')
+        ])
+
+    ws_summary = build_table_sheet(
+        'Resumen',
+        ['Tipología', 'Subtipo o corte', 'Total registros', 'Ir a hoja'],
+        summary_sheet_rows,
+        index=1,
+    )
+    for row in ws_summary.iter_rows(min_row=2):
+        if row[1].value == 'Total tipología':
+            for cell in row:
+                cell.font = Font(bold=True, color='184336')
+                cell.fill = PatternFill(start_color='F1F7F5', end_color='F1F7F5', fill_type='solid')
+
+    new_knowledge_rows = []
+    for row in products['articles']:
+        new_knowledge_rows.append([
+            'Artículo',
+            normalize_export_value(row.get('title')),
+            row.get('year') or 'N/A',
+            normalize_export_value(row.get('group', {}).get('code') if row.get('group') else None),
+            normalize_export_value(row.get('group', {}).get('name') if row.get('group') else None),
+            normalize_export_value(row.get('category'), 'N/R'),
+            normalize_export_value(row.get('categorySource'), 'N/R'),
+            normalize_export_value(row.get('issn')),
+            normalize_export_value(row.get('doi')),
+            join_authors(row.get('authors')),
+        ])
+    for row in products['books']:
+        new_knowledge_rows.append([
+            'Libro',
+            normalize_export_value(row.get('title')),
+            row.get('year') or 'N/A',
+            normalize_export_value(row.get('group', {}).get('code') if row.get('group') else None),
+            normalize_export_value(row.get('group', {}).get('name') if row.get('group') else None),
+            'N/A',
+            'N/A',
+            normalize_export_value(row.get('isbn')),
+            'N/A',
+            join_authors(row.get('authors')),
+        ])
+    for row in products['bookChapters']:
+        new_knowledge_rows.append([
+            'Capítulo de libro',
+            normalize_export_value(row.get('chapterTitle')),
+            row.get('year') or 'N/A',
+            normalize_export_value(row.get('group', {}).get('code') if row.get('group') else None),
+            normalize_export_value(row.get('group', {}).get('name') if row.get('group') else None),
+            normalize_export_value(row.get('bookTitle')),
+            'N/A',
+            normalize_export_value(row.get('isbn')),
+            'N/A',
+            join_authors(row.get('authors')),
+        ])
+    if new_knowledge_rows:
+        build_table_sheet(
+            'Nuevo conocimiento',
+            ['Tipo de registro', 'Título del producto', 'Año', 'Código del grupo', 'Grupo', 'Categoría o contenedor', 'Fuente de categoría', 'ISSN / ISBN', 'DOI', 'Autores'],
+            new_knowledge_rows,
+        )
+
+    thesis_rows = [
+        [
+            normalize_export_value(row.get('title')),
+            row.get('year') or 'N/A',
+            normalize_export_value(row.get('thesisType')),
+            normalize_export_value(row.get('institution')),
+            normalize_export_value(row.get('group', {}).get('code') if row.get('group') else None),
+            normalize_export_value(row.get('group', {}).get('name') if row.get('group') else None),
+            join_authors(row.get('authors'), include_roles=True),
+        ]
+        for row in products['theses']
+    ]
+    if thesis_rows:
+        build_table_sheet(
+            'Formación RH',
+            ['Trabajo dirigido', 'Año', 'Nivel o tipo', 'Institución', 'Código del grupo', 'Grupo', 'Participantes'],
+            thesis_rows,
+        )
+
+    event_rows = [
+        [
+            normalize_export_value(row.get('title')),
+            normalize_export_value(row.get('startDate')),
+            normalize_export_value(row.get('endDate')),
+            normalize_export_value(row.get('eventType')),
+            normalize_export_value(row.get('scope')),
+            normalize_export_value(row.get('participationType')),
+            normalize_export_value(row.get('group', {}).get('code') if row.get('group') else None),
+            normalize_export_value(row.get('group', {}).get('name') if row.get('group') else None),
+            '\n'.join(row.get('institutions') or []) or 'N/A',
+        ]
+        for row in products.get('events', [])
+    ]
+    if event_rows:
+        build_table_sheet(
+            'Eventos científicos',
+            ['Evento', 'Fecha inicial', 'Fecha final', 'Clase de evento', 'Ámbito', 'Participación', 'Código del grupo', 'Grupo', 'Instituciones asociadas'],
+            event_rows,
+        )
+
+    def build_generic_sheet(category, sheet_name):
+        category_rows = [row for row in products.get('generic', []) if row.get('category') == category]
+        if not category_rows:
+            return
+        extra_keys = ordered_generic_extra_data_keys(category_rows)
+        has_raw_text = any(isinstance(row.get('extraData'), dict) and (row.get('extraData') or {}).get('raw_text') for row in category_rows)
+        headers = [
+            'Subtipo',
+            'Producto o resultado',
+            'Año',
+            'Código del grupo',
+            'Grupo',
+            'Autores',
+            *[humanize_extra_data_key(key) for key in extra_keys],
+            *(['Soporte textual complementario'] if has_raw_text else []),
+        ]
+        rows = []
+        for row in category_rows:
+            extra_data = row.get('extraData') or {}
+            rows.append([
+                normalize_export_value(row.get('tableName')),
+                normalize_export_value(row.get('title'), 'S/T'),
+                row.get('year') or 'N/A',
+                normalize_export_value(row.get('group', {}).get('code') if row.get('group') else None),
+                normalize_export_value(row.get('group', {}).get('name') if row.get('group') else None),
+                join_authors(row.get('authors')),
+                *[stringify_extra_data_value(extra_data.get(key)) for key in extra_keys],
+                *([stringify_extra_data_value(extra_data.get('raw_text'))] if has_raw_text else []),
+            ])
+        build_table_sheet(sheet_name, headers, rows)
+
+    build_generic_sheet('DTeI', 'DTeI')
+    build_generic_sheet('PASC', 'PASC')
+    build_generic_sheet('DP', 'DP')
+    add_summary_links(ws_summary)
+
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    filename = f"Tipologias-UCEVA-{timezone.localtime().strftime('%Y%m%d-%H%M')}.xlsx"
+    response = HttpResponse(
+        output.getvalue(),
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    )
+    response['Content-Disposition'] = f'attachment; filename="{filename}"'
+    return response
 
 @api_view(['GET'])
 def get_groups_list(request):
@@ -1245,6 +2068,78 @@ def get_groups_list(request):
     ]
     return Response(data)
 
+
+@api_view(['GET'])
+def get_researchers_list(request):
+    """
+    Returns all researchers with production counters and derived active status
+    for the global researchers listing page.
+    """
+
+    def _count_sq(model, fk='researcher_id', counted_field='id', active_only=False):
+        queryset = model.objects.filter(**{fk: OuterRef('pk')})
+        if active_only:
+            queryset = queryset.exclude(status__iexact='INACTIVE')
+
+        return Coalesce(
+            Subquery(
+                queryset
+                    .values(fk)
+                    .annotate(c=Count(counted_field, distinct=True))
+                    .values('c')[:1],
+                output_field=IntegerField(),
+            ),
+            0,
+        )
+
+    researchers = (
+        Researcher.objects
+        .only('id', 'name', 'code_rh', 'category', 'education_level', 'city', 'department', 'university', 'cvlac_url')
+        .annotate(
+            articles_count=_count_sq(ArticleAuthor, counted_field='article_id'),
+            books_count=_count_sq(BookAuthor, counted_field='book_id'),
+            chapters_count=_count_sq(ChapterAuthor, counted_field='chapter_id'),
+            thesis_tutor_count=_count_sq(ThesisTutor, counted_field='thesis_id'),
+            thesis_student_count=_count_sq(ThesisStudent, counted_field='thesis_id'),
+            groups_count=_count_sq(GroupMember, counted_field='group_id'),
+            active_groups_count=_count_sq(GroupMember, counted_field='group_id', active_only=True),
+        )
+        .order_by('name')
+    )
+
+    data = []
+    for researcher in researchers:
+        theses_count = (researcher.thesis_tutor_count or 0) + (researcher.thesis_student_count or 0)
+        total_count = (
+            (researcher.articles_count or 0)
+            + (researcher.books_count or 0)
+            + (researcher.chapters_count or 0)
+            + theses_count
+        )
+        status = 'ACTIVE' if (researcher.active_groups_count or 0) > 0 else 'INACTIVE'
+
+        data.append({
+            'id': str(researcher.id),
+            'name': researcher.name,
+            'codeRh': researcher.code_rh,
+            'category': researcher.category,
+            'educationLevel': researcher.education_level,
+            'city': researcher.city,
+            'department': researcher.department,
+            'university': researcher.university,
+            'cvlacUrl': researcher.cvlac_url,
+            'status': status,
+            'articlesCount': researcher.articles_count or 0,
+            'booksCount': researcher.books_count or 0,
+            'chaptersCount': researcher.chapters_count or 0,
+            'thesesCount': theses_count,
+            'groupsCount': researcher.groups_count or 0,
+            'totalCount': total_count,
+            'detailPath': f'/researchers/{researcher.id}',
+        })
+
+    return Response(data)
+
 @api_view(['GET'])
 def get_group_detail(request, group_id):
     group = ResearchGroup.objects.filter(id=group_id).first()
@@ -1259,7 +2154,16 @@ def export_group_detail_excel(request, group_id):
     if not group:
         return Response({'error': 'Group not found'}, status=404)
 
-    data = _build_group_detail_payload(group)
+    from_year = parse_optional_year_param(request.GET.get('fromYear'))
+    to_year = parse_optional_year_param(request.GET.get('toYear'))
+    if from_year and to_year and from_year > to_year:
+        to_year = None
+
+    data = filter_group_detail_payload_by_year_range(
+        _build_group_detail_payload(group),
+        from_year,
+        to_year,
+    )
 
     workbook = Workbook()
     default_sheet = workbook.active
@@ -1294,6 +2198,75 @@ def export_group_detail_excel(request, group_id):
                 max_len = max(max_len, len(cell_value))
             sheet.column_dimensions[col_letter].width = max(min(max_len + 2, max_width), min_width)
 
+    def style_table_body(sheet):
+        for row in sheet.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
+                cell.border = thin_border
+
+    def build_table_sheet(sheet_name, headers, rows, index=None):
+        sheet = workbook.create_sheet(sheet_name, index) if index is not None else workbook.create_sheet(sheet_name)
+        sheet.append(headers)
+        for row in rows:
+            sheet.append(row)
+        style_table_header(sheet, len(headers))
+        style_table_body(sheet)
+        auto_fit_columns(sheet)
+        return sheet
+
+    def join_authors(authors, only_group=None, include_roles=False):
+        entries = []
+        for author in authors or []:
+            is_group_member = author.get('isGroupMember')
+            if only_group is True and not is_group_member:
+                continue
+            if only_group is False and is_group_member:
+                continue
+
+            name = (author.get('name') or '').strip()
+            role = (author.get('role') or '').strip()
+            if not name and not role:
+                continue
+
+            if include_roles and role:
+                entries.append(f"{name} - {role}".strip(' -'))
+            else:
+                entries.append(name or role)
+
+        return '\n'.join(entries) if entries else 'N/A'
+
+    def normalize_export_value(value, fallback='N/A'):
+        if value is None:
+            return fallback
+        if isinstance(value, str):
+            cleaned = value.strip()
+            return cleaned if cleaned else fallback
+        return value
+
+    def count_by_label(items, label_getter, empty_label='Sin clasificar'):
+        counts = {}
+        for item in items:
+            raw_label = label_getter(item)
+            label = normalize_export_value(raw_label, empty_label)
+            counts[label] = counts.get(label, 0) + 1
+        return sorted(counts.items(), key=lambda entry: (-entry[1], entry[0]))
+
+    def add_summary_links(sheet):
+        for row in sheet.iter_rows(min_row=2):
+            target_sheet = row[3].value
+            if not target_sheet or target_sheet not in workbook.sheetnames:
+                continue
+            row[3].hyperlink = Hyperlink(
+                ref=row[3].coordinate,
+                location=f"{quote_sheetname(target_sheet)}!A1",
+                display=str(row[3].value),
+            )
+            row[3].font = Font(
+                color='0563C1',
+                underline='single',
+                bold=(row[1].value == 'Total tipología' or row[0].value == 'Investigadores'),
+            )
+
     cover_sheet = workbook.create_sheet('Portada', 0)
     group_code = (group.code or 'SIN-CODIGO').strip()
     group_name = (group.name or 'Grupo').strip()
@@ -1311,10 +2284,41 @@ def export_group_detail_excel(request, group_id):
     cover_sheet['B5'] = group.category or 'N/A'
     cover_sheet['A6'] = 'Líder'
     cover_sheet['B6'] = group.leader or 'N/A'
-    cover_sheet['A7'] = 'Fecha de generación'
-    cover_sheet['B7'] = timezone.localtime().strftime('%Y-%m-%d %H:%M')
+    cover_sheet['A7'] = 'Sitio web'
+    cover_sheet['B7'] = normalize_export_value(group.website)
+    cover_sheet['A8'] = 'Gruplac / MinCiencias'
+    cover_sheet['B8'] = normalize_export_value(data.get('gruplacUrl'))
+    cover_sheet['A9'] = 'Periodo exportado'
+    cover_sheet['B9'] = describe_export_year_filter(from_year, to_year)
+    cover_sheet['A10'] = 'Fecha de generación'
+    cover_sheet['B10'] = timezone.localtime().strftime('%Y-%m-%d %H:%M')
 
-    for row in range(3, 8):
+    summary_rows = [
+        ('Investigadores activos', sum(1 for researcher in data['researchers'] if researcher.get('status') != 'INACTIVE')),
+        ('Investigadores inactivos', sum(1 for researcher in data['researchers'] if researcher.get('status') == 'INACTIVE')),
+        ('Nuevo conocimiento', len(data['products']['articles']) + len(data['products']['books']) + len(data['products']['bookChapters'])),
+        ('Formación de recurso humano', len(data['products']['theses'])),
+        ('Eventos científicos', len(data['products'].get('events', []))),
+        ('DTeI', sum(1 for product in data['products'].get('generic', []) if product.get('category') == 'DTeI')),
+        ('PASC', sum(1 for product in data['products'].get('generic', []) if product.get('category') == 'PASC')),
+        ('DP', sum(1 for product in data['products'].get('generic', []) if product.get('category') == 'DP')),
+    ]
+
+    cover_sheet['D3'] = 'Resumen exportado'
+    cover_sheet['D3'].font = Font(bold=True, color='184336')
+    for row_index, (label, value) in enumerate(summary_rows, start=4):
+        cover_sheet[f'D{row_index}'] = label
+        cover_sheet[f'E{row_index}'] = value
+        label_cell = cover_sheet[f'D{row_index}']
+        value_cell = cover_sheet[f'E{row_index}']
+        label_cell.font = Font(bold=True, color='184336')
+        label_cell.fill = PatternFill(start_color='E6F1EE', end_color='E6F1EE', fill_type='solid')
+        label_cell.alignment = Alignment(horizontal='left', vertical='center')
+        label_cell.border = thin_border
+        value_cell.alignment = Alignment(horizontal='center', vertical='center')
+        value_cell.border = thin_border
+
+    for row in range(3, 11):
         label_cell = cover_sheet[f'A{row}']
         value_cell = cover_sheet[f'B{row}']
         label_cell.font = Font(bold=True, color='184336')
@@ -1326,104 +2330,195 @@ def export_group_detail_excel(request, group_id):
 
     cover_sheet.column_dimensions['A'].width = 28
     cover_sheet.column_dimensions['B'].width = 60
+    cover_sheet.column_dimensions['D'].width = 30
+    cover_sheet.column_dimensions['E'].width = 16
     cover_sheet.row_dimensions[1].height = 30
 
-    ws_researchers = workbook.create_sheet('Investigadores')
-    ws_researchers.append(['Código RH', 'Nombre', 'Categoría', 'Tipo Vinculación', 'Estado'])
-    for row in data['researchers']:
-        status_text = 'Activo' if row.get('status') == 'ACTIVE' else ('Inactivo' if row.get('status') == 'INACTIVE' else row.get('status'))
-        ws_researchers.append([
-            row.get('codeRh') or 'N/A',
-            row.get('name'),
-            row.get('category') or 'N/A',
-            row.get('membershipType') or 'N/A',
-            status_text or 'N/A'
+    summary_sheet_rows = [
+        ['Investigadores', 'Total registrados', len(data['researchers']), 'Investigadores'],
+        ['Investigadores', 'Activos', sum(1 for researcher in data['researchers'] if researcher.get('status') != 'INACTIVE'), 'Investigadores'],
+        ['Investigadores', 'Inactivos', sum(1 for researcher in data['researchers'] if researcher.get('status') == 'INACTIVE'), 'Investigadores'],
+        ['Nuevo conocimiento', 'Total tipología', len(data['products']['articles']) + len(data['products']['books']) + len(data['products']['bookChapters']), 'Nuevo conocimiento'],
+        ['Nuevo conocimiento', 'Artículos', len(data['products']['articles']), 'Nuevo conocimiento'],
+        ['Nuevo conocimiento', 'Libros', len(data['products']['books']), 'Nuevo conocimiento'],
+        ['Nuevo conocimiento', 'Capítulos de libro', len(data['products']['bookChapters']), 'Nuevo conocimiento'],
+        ['Formación RH', 'Total tipología', len(data['products']['theses']), 'Formación RH'],
+    ]
+
+    summary_sheet_rows.extend([
+        ['Formación RH', subtype, total, 'Formación RH']
+        for subtype, total in count_by_label(data['products']['theses'], lambda item: item.get('thesisType'))
+    ])
+    summary_sheet_rows.append(['Eventos científicos', 'Total tipología', len(data['products'].get('events', [])), 'Eventos científicos'])
+    summary_sheet_rows.extend([
+        ['Eventos científicos', subtype, total, 'Eventos científicos']
+        for subtype, total in count_by_label(data['products'].get('events', []), lambda item: item.get('eventType'))
+    ])
+
+    for category in ('DTeI', 'PASC', 'DP'):
+        category_rows = [row for row in data['products'].get('generic', []) if row.get('category') == category]
+        summary_sheet_rows.append([category, 'Total tipología', len(category_rows), category])
+        summary_sheet_rows.extend([
+            [category, subtype, total, category]
+            for subtype, total in count_by_label(category_rows, lambda item: item.get('tableName'), 'Otros productos')
         ])
-    style_table_header(ws_researchers, 5)
-    auto_fit_columns(ws_researchers)
 
-    ws_articles = workbook.create_sheet('Artículos')
-    ws_articles.append(['Título', 'Año', 'Categoría', 'Fuente', 'ISSN', 'DOI', 'Investigadores del Grupo', 'Otros Investigadores'])
+    ws_summary = build_table_sheet(
+        'Resumen',
+        ['Tipología', 'Subtipo o corte', 'Total registros', 'Ir a hoja'],
+        summary_sheet_rows,
+        index=1,
+    )
+    for row in ws_summary.iter_rows(min_row=2):
+        if row[1].value == 'Total tipología' or row[0].value == 'Investigadores':
+            for cell in row:
+                cell.font = Font(bold=True, color='184336')
+                cell.fill = PatternFill(start_color='F1F7F5', end_color='F1F7F5', fill_type='solid')
+
+    build_table_sheet(
+        'Investigadores',
+        ['Código RH', 'Investigador', 'Categoría', 'Vinculación', 'Estado'],
+        [
+            [
+                row.get('codeRh') or 'N/A',
+                row.get('name'),
+                row.get('category') or 'N/A',
+                row.get('membershipType') or 'N/A',
+                'Activo' if row.get('status') == 'ACTIVE' else ('Inactivo' if row.get('status') == 'INACTIVE' else (row.get('status') or 'N/A')),
+            ]
+            for row in data['researchers']
+        ]
+    )
+
+    new_knowledge_rows = []
     for row in data['products']['articles']:
-        category_value = (row.get('category') or '').strip() if isinstance(row.get('category'), str) else row.get('category')
-        category_value = category_value if category_value else 'N/R'
-        source_value = (row.get('categorySource') or '').strip() if isinstance(row.get('categorySource'), str) else row.get('categorySource')
-        source_value = source_value if source_value else 'N/R'
-
-        if category_value == 'N/R':
-            source_value = 'N/R'
-
-        ws_articles.append([
-            row['title'],
-            row.get('year'),
+        category_value = normalize_export_value(row.get('category'), 'N/R')
+        source_value = normalize_export_value(row.get('categorySource'), 'N/R') if category_value != 'N/R' else 'N/R'
+        new_knowledge_rows.append([
+            'Artículo',
+            normalize_export_value(row.get('title')),
+            row.get('year') or 'N/A',
+            'N/A',
             category_value,
             source_value,
-            row.get('issn'),
-            row.get('doi'),
-            ', '.join([a.get('name', '') for a in row.get('authors', []) if a.get('isGroupMember')]),
-            ', '.join([a.get('name', '') for a in row.get('authors', []) if not a.get('isGroupMember')]),
+            normalize_export_value(row.get('issn')),
+            normalize_export_value(row.get('doi')),
+            join_authors(row.get('authors'), only_group=True),
+            join_authors(row.get('authors'), only_group=False),
         ])
-    style_table_header(ws_articles, 8)
-    auto_fit_columns(ws_articles)
 
-    ws_books = workbook.create_sheet('Libros')
-    ws_books.append(['Título', 'Año', 'ISBN', 'Investigadores del Grupo', 'Otros Investigadores'])
     for row in data['products']['books']:
-        ws_books.append([
-            row['title'],
-            row.get('year'),
-            row.get('isbn'),
-            ', '.join([a.get('name', '') for a in row.get('authors', []) if a.get('isGroupMember')]),
-            ', '.join([a.get('name', '') for a in row.get('authors', []) if not a.get('isGroupMember')]),
+        new_knowledge_rows.append([
+            'Libro',
+            normalize_export_value(row.get('title')),
+            row.get('year') or 'N/A',
+            'N/A',
+            'N/A',
+            'N/A',
+            normalize_export_value(row.get('isbn')),
+            'N/A',
+            join_authors(row.get('authors'), only_group=True),
+            join_authors(row.get('authors'), only_group=False),
         ])
-    style_table_header(ws_books, 5)
-    auto_fit_columns(ws_books)
 
-    ws_chapters = workbook.create_sheet('Capítulos')
-    ws_chapters.append(['Capítulo', 'Libro', 'Año', 'ISBN', 'Investigadores del Grupo', 'Otros Investigadores'])
     for row in data['products']['bookChapters']:
-        ws_chapters.append([
-            row.get('chapterTitle'),
-            row.get('bookTitle'),
-            row.get('year'),
-            row.get('isbn'),
-            ', '.join([a.get('name', '') for a in row.get('authors', []) if a.get('isGroupMember')]),
-            ', '.join([a.get('name', '') for a in row.get('authors', []) if not a.get('isGroupMember')]),
+        new_knowledge_rows.append([
+            'Capítulo de libro',
+            normalize_export_value(row.get('chapterTitle')),
+            row.get('year') or 'N/A',
+            normalize_export_value(row.get('bookTitle')),
+            'N/A',
+            'N/A',
+            normalize_export_value(row.get('isbn')),
+            'N/A',
+            join_authors(row.get('authors'), only_group=True),
+            join_authors(row.get('authors'), only_group=False),
         ])
-    style_table_header(ws_chapters, 6)
-    auto_fit_columns(ws_chapters)
 
-    ws_theses = workbook.create_sheet('Tesis')
-    ws_theses.append(['Título', 'Año', 'Tipo', 'Institución', 'Involucrados del Grupo', 'Involucrados Externos'])
-    for row in data['products']['theses']:
-        ws_theses.append([
-            row.get('title'),
-            row.get('year'),
-            row.get('thesisType'),
-            row.get('institution'),
-            '\n'.join([f"{a.get('name', '')} - {a.get('role', '')}".strip(' -') for a in row.get('authors', []) if a.get('isGroupMember')]),
-            '\n'.join([f"{a.get('name', '')} - {a.get('role', '')}".strip(' -') for a in row.get('authors', []) if not a.get('isGroupMember')]),
-        ])
-    style_table_header(ws_theses, 6)
-    auto_fit_columns(ws_theses)
-    
-    ws_generic = workbook.create_sheet('Otros Productos')
-    ws_generic.append(['Título', 'Año', 'Categoría', 'Tipo de Producto', 'Investigadores', 'Detalles Adicionales'])
-    for row in data['products'].get('generic', []):
-        extra_data_str = ", ".join([f"{k}: {v}" for k, v in row.get('extraData', {}).items() if k != 'raw_text'])
-        if not extra_data_str:
-             extra_data_str = row.get('extraData', {}).get('raw_text', '')
-             
-        ws_generic.append([
-            row.get('title') or 'S/T',
-            row.get('year'),
-            row.get('category'),
-            row.get('tableName'),
-            ', '.join([a.get('name', '') for a in row.get('authors', [])]),
-            extra_data_str
-        ])
-    style_table_header(ws_generic, 6)
-    auto_fit_columns(ws_generic)
+    if new_knowledge_rows:
+        build_table_sheet(
+            'Nuevo conocimiento',
+            ['Tipo de registro', 'Título del producto', 'Año', 'Libro o contenedor', 'Categoría', 'Fuente de categoría', 'ISSN / ISBN', 'DOI', 'Autores del grupo', 'Autores externos'],
+            new_knowledge_rows,
+        )
+
+    theses_rows = [
+        [
+            normalize_export_value(row.get('title')),
+            row.get('year') or 'N/A',
+            normalize_export_value(row.get('thesisType')),
+            normalize_export_value(row.get('institution')),
+            join_authors(row.get('authors'), only_group=True, include_roles=True),
+            join_authors(row.get('authors'), only_group=False, include_roles=True),
+        ]
+        for row in data['products']['theses']
+    ]
+    if theses_rows:
+        build_table_sheet(
+            'Formación RH',
+            ['Trabajo dirigido', 'Año', 'Nivel o tipo', 'Institución', 'Participación del grupo', 'Participación externa'],
+            theses_rows,
+        )
+
+    event_rows = [
+        [
+            normalize_export_value(row.get('title')),
+            normalize_export_value(row.get('startDate')),
+            normalize_export_value(row.get('endDate')),
+            normalize_export_value(row.get('eventType')),
+            normalize_export_value(row.get('scope')),
+            normalize_export_value(row.get('participationType')),
+            normalize_export_value(row.get('city')),
+            normalize_export_value(row.get('country')),
+            '\n'.join(row.get('institutions') or []) or 'N/A',
+        ]
+        for row in data['products'].get('events', [])
+    ]
+    if event_rows:
+        build_table_sheet(
+            'Eventos científicos',
+            ['Evento', 'Fecha inicial', 'Fecha final', 'Clase de evento', 'Ámbito', 'Tipo de participación', 'Ciudad', 'País', 'Instituciones asociadas'],
+            event_rows,
+        )
+
+    def build_generic_category_sheet(category, sheet_name):
+        category_rows = [row for row in data['products'].get('generic', []) if row.get('category') == category]
+        if not category_rows:
+            return
+
+        extra_keys = ordered_generic_extra_data_keys(category_rows)
+        has_raw_text = any(
+            isinstance(row.get('extraData'), dict) and (row.get('extraData') or {}).get('raw_text')
+            for row in category_rows
+        )
+        headers = [
+            'Subtipo',
+            'Producto o resultado',
+            'Año',
+            'Autores del grupo',
+            'Autores externos',
+            *[humanize_extra_data_key(key) for key in extra_keys],
+            *(['Soporte textual complementario'] if has_raw_text else []),
+        ]
+        rows = []
+        for row in category_rows:
+            extra_data = row.get('extraData') or {}
+            rows.append([
+                normalize_export_value(row.get('tableName')),
+                normalize_export_value(row.get('title'), 'S/T'),
+                row.get('year') or 'N/A',
+                join_authors(row.get('authors'), only_group=True),
+                join_authors(row.get('authors'), only_group=False),
+                *[stringify_extra_data_value(extra_data.get(key)) for key in extra_keys],
+                *([stringify_extra_data_value(extra_data.get('raw_text'))] if has_raw_text else []),
+            ])
+        build_table_sheet(sheet_name, headers, rows)
+
+    build_generic_category_sheet('DTeI', 'DTeI')
+    build_generic_category_sheet('PASC', 'PASC')
+    build_generic_category_sheet('DP', 'DP')
+
+    add_summary_links(ws_summary)
 
     output = BytesIO()
     workbook.save(output)
@@ -1549,60 +2644,166 @@ def get_stats(request):
     
     return Response(data)
 
+def _count_related_country_items(model, foreign_key_name):
+    return Coalesce(
+        Subquery(
+            model.objects
+                .filter(**{foreign_key_name: OuterRef('pk')})
+                .values(foreign_key_name)
+                .annotate(c=Count('id', distinct=True))
+                .values('c')[:1],
+            output_field=IntegerField(),
+        ),
+        0,
+    )
+
+
+def _get_country_network_records():
+    countries_qs = Country.objects.annotate(
+        articles_count=_count_related_country_items(Article, 'country_id'),
+        books_count=_count_related_country_items(Book, 'country_id'),
+        events_count=_count_related_country_items(ScientificEvent, 'country_obj_id'),
+    ).order_by('name')
+
+    grouped_records = {}
+    for country in countries_qs:
+        total_count = (country.articles_count or 0) + (country.books_count or 0) + (country.events_count or 0)
+        if total_count <= 0:
+            continue
+
+        canonical_key = canonicalize_country_name(country.name)
+        display_name = COUNTRY_CANONICAL_DISPLAY_NAMES.get(canonical_key, country.name.title())
+        record = grouped_records.setdefault(canonical_key, {
+            'id': f'country:{canonical_key}',
+            'name': display_name,
+            'name_clean': remove_accents(display_name).title(),
+            'name_normalized': canonical_key,
+            'articles_count': 0,
+            'books_count': 0,
+            'events_count': 0,
+            'total_count': 0,
+        })
+
+        record['articles_count'] += country.articles_count or 0
+        record['books_count'] += country.books_count or 0
+        record['events_count'] += country.events_count or 0
+        record['total_count'] += total_count
+
+    return list(grouped_records.values())
+
+
+def _build_country_network_summary(record, is_colombia=False):
+    if is_colombia:
+        return 'Sede principal de la producción nacional.'
+
+    summary_parts = []
+    if record['articles_count']:
+        summary_parts.append(f"{record['articles_count']} artículos")
+    if record['books_count']:
+        summary_parts.append(f"{record['books_count']} libros")
+    if record['events_count']:
+        summary_parts.append(f"{record['events_count']} eventos")
+
+    return ' / '.join(summary_parts) if summary_parts else 'Cooperación activa en investigación.'
+
+
 @api_view(['GET'])
 def get_cooperation_map(request):
     """
-    Returns list of countries involved in Articles, with coordinates.
+    Returns list of countries involved in georeferenced production, with coordinates.
     """
-    # 1. Get Countries with at least 1 article
-    countries_qs = Country.objects.annotate(
-        article_count=Count('articles')
-    ).filter(article_count__gt=0).order_by('-article_count')
-    
     hubs = []
-    
-    for c in countries_qs:
-        name_lower = c.name.lower().strip()
-        
-        # Simple coordinate lookup
-        coords = None
-        if name_lower in COUNTRY_COORDINATES:
-             coords = COUNTRY_COORDINATES[name_lower]
-        
-        # If found, add to hubs
-        if coords:
-            # Override Colombia info as main hub
-            is_col = name_lower == 'colombia'
-            hub = {
-                "lat": coords['lat'],
-                "lng": coords['lng'],
-                "id": str(c.id),
-                "name": c.name.title(), # Use title case for nice tooltips
-                "name_clean": remove_accents(c.name).title(), # Cleaned for 3D Text
-                "value": c.article_count,
-                "info": "Nodo Central UCEVA" if is_col else f"{c.article_count} Artículos conjuntos", 
-                "summary": "Sede Principal UCEVA" if is_col else "Cooperación activa en investigación.",
-                "link": f"/reporte/{c.name}"
-            }
-            if is_col:
-                hubs.insert(0, hub) # Ensure Colombia is first
-            else:
-                hubs.append(hub)
-    
-    # Fallback if Colombia not in DB (unlikely)
-    if not any(h['name'].lower() == 'colombia' for h in hubs):
-         hubs.insert(0, {
-            "lat": 4.5709, "lng": -74.2973,
-            "id": "colombia-main",
-            "name": "Colombia",
-            "name_clean": "Colombia",
-            "value": 100,
-            "info": "Nodo Central UCEVA",
-            "summary": "Sede Principal",
-            "link": "/reporte/colombia"
-         })
+
+    for record in _get_country_network_records():
+        coords = COUNTRY_COORDINATES.get(record['name_normalized'])
+        if not coords:
+            continue
+
+        is_colombia = record['name_normalized'] == 'colombia'
+
+        hub = {
+            'lat': coords['lat'],
+            'lng': coords['lng'],
+            'id': record['id'],
+            'name': record['name'],
+            'name_clean': record['name_clean'],
+            'value': record['total_count'],
+            'info': 'Nodo central UCEVA' if is_colombia else f"{record['total_count']} registros asociados",
+            'summary': _build_country_network_summary(record, is_colombia=is_colombia),
+            'link': f"/report/{record['name']}"
+        }
+        if is_colombia:
+            hubs.insert(0, hub)
+        else:
+            hubs.append(hub)
+
+    if not any(hub['name'].lower() == 'colombia' for hub in hubs):
+        hubs.insert(0, {
+            'lat': 4.5709,
+            'lng': -74.2973,
+            'id': 'colombia-main',
+            'name': 'Colombia',
+            'name_clean': 'Colombia',
+            'value': 0,
+            'info': 'Nodo central UCEVA',
+            'summary': 'Sede principal de la producción nacional.',
+            'link': '/report/colombia'
+        })
 
     return Response(hubs)
+
+
+@api_view(['GET'])
+def get_map_metrics(request):
+    records = _get_country_network_records()
+    national_record = next((record for record in records if record['name_normalized'] == 'colombia'), None)
+    national_total = national_record['total_count'] if national_record else 0
+    international_total = sum(record['total_count'] for record in records if record['name_normalized'] != 'colombia')
+    countries_in_network = len(records)
+    featured_country = max(
+        (record for record in records if record['name_normalized'] != 'colombia'),
+        key=lambda record: (record['total_count'], record['name']),
+        default=None,
+    )
+
+    return Response({
+        'nationalProduction': national_total,
+        'internationalProduction': international_total,
+        'countriesInNetwork': countries_in_network,
+        'featuredCountry': {
+            'name': featured_country['name'],
+            'summary': _build_country_network_summary(featured_country),
+            'totalRecords': featured_country['total_count'],
+            'link': f"/report/{featured_country['name']}",
+        } if featured_country else None,
+    })
+
+
+@api_view(['GET'])
+def get_country_reports_list(request):
+    """
+    Returns countries with associated production counts for the reports index page.
+    """
+    reports = []
+
+    for record in sorted(
+        _get_country_network_records(),
+        key=lambda item: (-item['total_count'], item['name'])
+    ):
+        is_colombia = record['name_normalized'] == 'colombia'
+        reports.append({
+            'id': record['id'],
+            'name': record['name'],
+            'scope': 'Nacional' if is_colombia else 'Internacional',
+            'summary': _build_country_network_summary(record, is_colombia=is_colombia),
+            'articlesCount': record['articles_count'],
+            'booksCount': record['books_count'],
+            'eventsCount': record['events_count'],
+            'totalCount': record['total_count'],
+            'detailPath': f"/report/{record['name']}",
+        })
+
+    return Response(reports)
 
 from scienti.models import Country, Researcher, Article, Thesis, Book, BookChapter, ResearchGroup
 
@@ -1612,58 +2813,17 @@ def get_country_details(request, country_id):
     
     # Ensure proper decoding of URL parameter
     country_id = urllib.parse.unquote(country_id)
-    country = None
+    matched_countries, display_name, canonical_key = resolve_country_group(country_id)
 
-    
-    # Try UUID lookup first
-    try:
-        import uuid
-        uuid_obj = uuid.UUID(country_id)
-        country = Country.objects.filter(id=uuid_obj).first()
-    except (ValueError, TypeError):
-        pass
-    
-    # If not UUID, try Name lookup (slug/name from URL)
-    if not country:
-        # Basic cleanup: spaces and dashes
-        raw_name = country_id.strip()
-        name_spaced = raw_name.replace('-', ' ')
-        
-        # 1. Try exact/insensitive match on raw input
-        country = Country.objects.filter(name__iexact=raw_name).first()
-        
-        # 2. Try match with spaces instead of dashes
-        if not country:
-            country = Country.objects.filter(name__iexact=name_spaced).first()
-            
-        # 3. Fuzzy match (accent insensitive manually) for SQLite limitations
-        if not country:
-            # Get all countries and find match in Python (Table is small < 200 rows)
-            search_normalized = remove_accents(name_spaced).lower()
-            
-            all_countries = Country.objects.all()
-            for c in all_countries:
-                c_norm = remove_accents(c.name).lower()
-                if c_norm == search_normalized:
-                    country = c
-                    break
-            
-            # 4. Try partial match if still not found (e.g. "Estados Unidos" vs "Estados Unidos de America")
-            if not country:
-                 for c in all_countries:
-                    c_norm = remove_accents(c.name).lower()
-                    if search_normalized in c_norm or c_norm in search_normalized:
-                        # Only match if length difference isn't huge to avoid false positives
-                        if len(search_normalized) > 3: 
-                            country = c
-                            break
-            
-    if not country:
+    if not matched_countries:
         return Response({"error": f"Country '{country_id}' not found"}, status=404)
 
+    country_ids = [country.id for country in matched_countries]
+    countries_qs = Country.objects.filter(id__in=country_ids)
+
     # Calculate stats
-    articles_qs = Article.objects.filter(country=country)
-    books_qs = Book.objects.filter(country=country)
+    articles_qs = Article.objects.filter(country__in=countries_qs)
+    books_qs = Book.objects.filter(country__in=countries_qs)
     
     # Try to find chapters via Book title match (best effort)
     # Get titles of books published in this country
@@ -1685,10 +2845,10 @@ def get_country_details(request, country_id):
         'title', 'year', 'isbn'
     )
 
-    researcher_ids = Article.objects.filter(country=country).values_list('authors__researcher', flat=True)
+    researcher_ids = Article.objects.filter(country__in=countries_qs).values_list('authors__researcher', flat=True)
     researcher_ids = [rid for rid in researcher_ids if rid]
     
-    book_researcher_ids = Book.objects.filter(country=country).values_list('authors__researcher', flat=True)
+    book_researcher_ids = Book.objects.filter(country__in=countries_qs).values_list('authors__researcher', flat=True)
     
     all_researcher_ids = list(researcher_ids) + list(book_researcher_ids)
     all_researcher_ids = [rid for rid in all_researcher_ids if rid]
@@ -1698,8 +2858,8 @@ def get_country_details(request, country_id):
     top_researchers_qs = Researcher.objects.filter(
         id__in=all_researcher_ids
     ).annotate(
-        relevant_pubs=Count('articleauthor', filter=models.Q(articleauthor__article__country=country)) + 
-                      Count('bookauthor', filter=models.Q(bookauthor__book__country=country))
+        relevant_pubs=Count('articleauthor', filter=models.Q(articleauthor__article__country__in=countries_qs)) + 
+                      Count('bookauthor', filter=models.Q(bookauthor__book__country__in=countries_qs))
     ).order_by('-relevant_pubs')[:5]
     
     top_researchers = [
@@ -1710,11 +2870,11 @@ def get_country_details(request, country_id):
         for r in top_researchers_qs
     ]
 
-    grp_ids_art = Article.objects.filter(country=country).values_list('group_id', flat=True)
+    grp_ids_art = Article.objects.filter(country__in=countries_qs).values_list('group_id', flat=True)
     
-    grp_ids_bk = Book.objects.filter(country=country).values_list('group_id', flat=True)
+    grp_ids_bk = Book.objects.filter(country__in=countries_qs).values_list('group_id', flat=True)
     
-    grp_ids_evt = ScientificEvent.objects.filter(country_obj=country).values_list('group_id', flat=True)
+    grp_ids_evt = ScientificEvent.objects.filter(country_obj__in=countries_qs).values_list('group_id', flat=True)
     
     all_grp_ids = set(list(grp_ids_art) + list(grp_ids_bk) + list(grp_ids_evt))
     
@@ -1726,8 +2886,8 @@ def get_country_details(request, country_id):
     
     if not areas:
         top_groups_qs = ResearchGroup.objects.filter(id__in=all_grp_ids).annotate(
-            count=Count('articles', filter=models.Q(articles__country=country)) + 
-                  Count('books', filter=models.Q(books__country=country))
+            count=Count('articles', filter=models.Q(articles__country__in=countries_qs)) + 
+                  Count('books', filter=models.Q(books__country__in=countries_qs))
         ).order_by('-count')[:3]
         areas = [g.name for g in top_groups_qs]
 
@@ -1749,7 +2909,7 @@ def get_country_details(request, country_id):
         _r_books.append(b)
 
     return Response({
-        "name": country.name.title(),
+        "name": display_name or get_country_display_name(country_id),
         "info": "",
         "stats": {
             "articles": articles_count,

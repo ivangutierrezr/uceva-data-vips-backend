@@ -5,32 +5,28 @@ from django.core.management.base import BaseCommand
 from django.conf import settings
 from scienti.models import Article, ArticleCategory, ArticleCategorySource
 
-# ---------------------------------------------------------------------------
-# Homologation table: Scimago quartiles → Publindex-style letters.
-# The app only shows A1, A2, B, C — Q values are mapped on ingestion.
-# ---------------------------------------------------------------------------
-QUARTILE_TO_LETTER = {
-    'Q1': 'A1',
-    'Q2': 'A2',
-    'Q3': 'B',
-    'Q4': 'C',
-}
-
-def homologate_category(raw: str) -> str:
-    """Normalize a raw category value to A1/A2/B/C when possible."""
+def normalize_category(raw: str) -> str:
+    """Normalize a raw category value to a simple string when possible."""
     if not raw:
         return raw
-    normalized = str(raw).strip().upper()
-    return QUARTILE_TO_LETTER.get(normalized, str(raw).strip())
+    return str(raw).strip()
 
 class Command(BaseCommand):
-    help = 'Enrich articles with categories from SCIMago and Publindex'
+    help = 'Enrich articles with categories from Publindex datasets only'
 
     def handle(self, *args, **options):
         self.stdout.write("Starting Article Enrichment Process...")
-        
-        scimago_source, _ = ArticleCategorySource.objects.get_or_create(name='SCIMAGO')
+
         publindex_source, _ = ArticleCategorySource.objects.get_or_create(name='PUBLINDEX')
+
+        deleted_scimago_categories, _ = ArticleCategory.objects.filter(source__name='SCIMAGO').delete()
+        ArticleCategorySource.objects.filter(name='SCIMAGO').delete()
+        if deleted_scimago_categories:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Removed {deleted_scimago_categories} existing article category rows from SCIMAGO to keep Publindex as the only source."
+                )
+            )
         
         self.stdout.write("Loading Articles from DB (Year > 2019)...")
         articles = Article.objects.filter(year__gt=2019).exclude(issn__isnull=True).exclude(issn__exact='').values('id', 'issn', 'year')
@@ -51,11 +47,8 @@ class Command(BaseCommand):
         self.stdout.write(f"Loaded {count} articles with valid ISSNs and Year > 2019.")
 
         base_dir = settings.BASE_DIR
-        scimago_dir = os.path.join(base_dir, 'datasets', 'scimago')
-        self.process_directory(scimago_dir, scimago_source, issn_map, 'scimago')
-
         publindex_dir = os.path.join(base_dir, 'datasets', 'publindex')
-        self.process_directory(publindex_dir, publindex_source, issn_map, 'publindex')
+        self.process_directory(publindex_dir, publindex_source, issn_map)
 
         self.stdout.write(self.style.SUCCESS("Enrichment process completed successfully."))
 
@@ -64,7 +57,7 @@ class Command(BaseCommand):
             return ""
         return re.sub(r'\D', '', str(text))
 
-    def process_directory(self, directory_path, source, issn_map, source_type):
+    def process_directory(self, directory_path, source, issn_map):
         if not os.path.exists(directory_path):
             self.stdout.write(self.style.WARNING(f"Directory not found: {directory_path}"))
             return
@@ -94,9 +87,9 @@ class Command(BaseCommand):
                 continue
             
             file_path = os.path.join(directory_path, filename)
-            self.process_file(file_path, years_covered, source, issn_map, source_type)
+            self.process_file(file_path, years_covered, source, issn_map)
 
-    def process_file(self, file_path, years_covered, source, issn_map, source_type):
+    def process_file(self, file_path, years_covered, source, issn_map):
         self.stdout.write(f"  -> Reading {file_path} for years {years_covered}...")
         try:
             if file_path.endswith('.csv'):
@@ -109,36 +102,11 @@ class Command(BaseCommand):
 
         df.columns = [str(c).strip().lower() for c in df.columns]
 
-        issn_col = None
-        category_col = None
-        
-        if 'issn' in df.columns: issn_col = 'issn'
-        
-        if source_type == 'scimago':
-            if 'sjr best quartile' in df.columns: 
-                category_col = 'sjr best quartile'
-            elif 'sjr' in df.columns:
-                 category_col = 'sjr'
-        elif source_type == 'publindex':
-            if 'categoria' in df.columns: category_col = 'categoria'
-            # specific fix for some publindex files where 'categoria' might be named differently?
-            # usually they are consistent.
-        
-        if (not issn_col or not category_col) and source_type == 'scimago':
-            try:
-                if len(df.columns) > 15:
-                    self.stdout.write("    Likely missing header. Reloading with header=None...")
-                    if file_path.endswith('.csv'):
-                        df = pd.read_csv(file_path, header=None)
-                    else:
-                        df = pd.read_excel(file_path, header=None)
-                    
-                    if 4 in df.columns and 9 in df.columns:
-                        issn_col = 4
-                        category_col = 9
-                        self.stdout.write("    -> ID'd columns by index: 4 (ISSN), 9 (Category)")
-            except Exception as e:
-                self.stdout.write(self.style.ERROR(f"    Error reloading file: {e}"))
+        issn_col = next((col for col in df.columns if 'issn' in str(col)), None)
+        category_col = next(
+            (col for col in df.columns if str(col).strip().lower() in {'categoria', 'categoría'}),
+            None,
+        )
 
         if issn_col is None or category_col is None:
              self.stdout.write(self.style.WARNING(f"    Skipping {file_path}: Missing columns. Found: {df.columns.tolist()[:5]}..."))
@@ -172,7 +140,7 @@ class Command(BaseCommand):
                     article_id=art['id'],
                     source=source,
                     year=art['year'], # Use the article's year
-                    defaults={'category': homologate_category(str(raw_cat))}
+                    defaults={'category': normalize_category(str(raw_cat))}
                 )
                 matches_count += 1
         

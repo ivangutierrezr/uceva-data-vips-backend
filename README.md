@@ -75,17 +75,18 @@ Este comando:
 4.  Guarda/Actualiza la base de datos local.
 5.  Limpia duplicados automáticamente.
 
+Nota: el flujo base ya no hace consultas individuales a CvLAC por cada investigador. Ese fallback quedó aislado para ejecución manual o en segundo plano.
+
 **Logs en Pantalla**: Verás el progreso detallado (Página X de Y, Grupos procesados, errores, etc).
 
 ---
 
 ## 📊 Enriquecimiento de Artículos (Categorización)
 
-Una vez ejecutado el scraper, puedes cruzar los datos con fuentes externas (SCIMAGO, PUBINDEX) para categorizar los artículos.
+Una vez ejecutado el scraper, puedes cruzar los datos con los archivos de Publindex para categorizar los artículos.
 
 1.  **Colocar Archivos**:
     Asegúrate de tener los archivos `.xlsx` o `.csv` en:
-    *   `uceva-data-vips-backend/datasets/scimago/` (Nombrados por año: `2019.xlsx`, `2024.xlsx`)
     *   `uceva-data-vips-backend/datasets/publindex/`
 
 2.  **Ejecutar Comando**:
@@ -93,6 +94,37 @@ Una vez ejecutado el scraper, puedes cruzar los datos con fuentes externas (SCIM
     python manage.py enrich_articles
     ```
     Este comando buscará por ISSN y guardará la categoría histórica de cada artículo.
+
+---
+
+## 👤 Enriquecimiento Lento De Investigadores (CvLAC)
+
+El comando base ahora usa solo `datos.gov.co` para no bloquear la sincronización general. Si quieres ejecutar el fallback histórico contra `CvLAC`, tienes dos opciones:
+
+1.  **Dentro del contenedor o del entorno Python activo**:
+    ```bash
+    python manage.py enrich_researchers --with-cvlac
+    ```
+
+2.  **Recorrer todos los investigadores con URL CvLAC y completar informacion faltante**:
+    ```bash
+    python manage.py enrich_researchers --cvlac-full
+    ```
+
+    Notas:
+    *   Recorre todos los investigadores con `cvlac_url`, no solo los que no tienen categoria.
+    *   Si `datos.gov.co` ya encontro una categoria y `CvLAC` no trae una mejor, se conserva la categoria existente.
+    *   `CvLAC` se usa para completar campos faltantes, especialmente categoria y nivel de formacion.
+
+3.  **En segundo plano desde el servidor Docker**:
+    ```bash
+    APP_SERVICE=web ./scripts/run_cvlac_enrichment_background.sh
+    ```
+
+    Notas:
+    *   `APP_SERVICE` por defecto es `web`, pero puedes cambiarlo si tu servicio Django tiene otro nombre.
+    *   El script genera un log en `logs/cvlac_enrichment_YYYYMMDD_HHMMSS.log`.
+    *   El proceso en background ejecuta solo `python manage.py enrich_researchers --cvlac-only`.
 
 ---
 
@@ -125,6 +157,11 @@ El proyecto incluye un `docker-compose.yml` básico para orquestar la aplicació
 3.  **Ejecutar Scraper dentro del Contenedor**:
     ```bash
     docker-compose exec web python manage.py sync_scienti
+    ```
+
+4.  **Ejecutar fallback CvLAC en background dentro del servidor**:
+    ```bash
+    APP_SERVICE=web ./scripts/run_cvlac_enrichment_background.sh
     ```
 
 ---

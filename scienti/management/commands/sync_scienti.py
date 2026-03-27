@@ -237,12 +237,12 @@ class Command(BaseCommand):
 
                 self.stdout.write(self.style.WARNING('Iniciando post-proceso secuencial (full)...'))
 
-                # 1) Enrich researcher profile fields from external source.
-                self.stdout.write(self.style.WARNING('1/5 Enriquecimiento de investigadores...'))
+                # 1) Enrich researcher profile fields from datos.gov.co only.
+                self.stdout.write(self.style.WARNING('1/5 Enriquecimiento base de investigadores (sin CvLAC individual)...'))
                 call_command('enrich_researchers')
-                self.stdout.write(self.style.SUCCESS('1/5 Enriquecimiento de investigadores completado.'))
+                self.stdout.write(self.style.SUCCESS('1/5 Enriquecimiento base de investigadores completado.'))
 
-                # 2) Enrich article categories using SCIMAGO/PUBLINDEX datasets.
+                # 2) Enrich article categories using Publindex datasets only.
                 self.stdout.write(self.style.WARNING('2/5 Enriquecimiento de categorias de articulos...'))
                 call_command('enrich_articles')
                 self.stdout.write(self.style.SUCCESS('2/5 Enriquecimiento de articulos completado.'))
