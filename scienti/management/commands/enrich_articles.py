@@ -28,8 +28,12 @@ class Command(BaseCommand):
                 )
             )
         
-        self.stdout.write("Loading Articles from DB (Year > 2019)...")
-        articles = Article.objects.filter(year__gt=2019).exclude(issn__isnull=True).exclude(issn__exact='').values('id', 'issn', 'year')
+        base_dir = settings.BASE_DIR
+        publindex_dir = os.path.join(base_dir, 'datasets', 'publindex')
+        min_year = self._detect_min_year(publindex_dir)
+
+        self.stdout.write(f"Loading Articles from DB (Year >= {min_year})...")
+        articles = Article.objects.filter(year__gte=min_year).exclude(issn__isnull=True).exclude(issn__exact='').values('id', 'issn', 'year')
         
         issn_map = {}
         count = 0 
@@ -44,18 +48,108 @@ class Command(BaseCommand):
                 issn_map[clean_val].append({'id': art['id'], 'year': year})
                 count += 1
         
-        self.stdout.write(f"Loaded {count} articles with valid ISSNs and Year > 2019.")
+        self.stdout.write(f"Loaded {count} articles with valid ISSNs and Year >= {min_year}.")
 
-        base_dir = settings.BASE_DIR
-        publindex_dir = os.path.join(base_dir, 'datasets', 'publindex')
         self.process_directory(publindex_dir, publindex_source, issn_map)
 
         self.stdout.write(self.style.SUCCESS("Enrichment process completed successfully."))
+
+        # Extra step: for articles with year=None but a valid ISSN, assign the
+        # earliest year found for that ISSN in Publindex.
+        self._enrich_missing_years(publindex_dir)
+
+    def _enrich_missing_years(self, publindex_dir):
+        """For articles with year=None and a valid ISSN, assign the earliest year
+        found in Publindex for that ISSN."""
+        null_year_articles = list(
+            Article.objects.filter(year__isnull=True)
+            .exclude(issn__isnull=True)
+            .exclude(issn__exact='')
+            .values('id', 'issn')
+        )
+        if not null_year_articles:
+            return
+
+        self.stdout.write(
+            f"Found {len(null_year_articles)} articles with year=None and valid ISSN. "
+            f"Checking Publindex for earliest year..."
+        )
+
+        # Build clean_issn -> set of years from all Publindex files
+        issn_years: dict[str, set] = {}
+        if not os.path.exists(publindex_dir):
+            return
+
+        for filename in sorted(os.listdir(publindex_dir)):
+            if not (filename.endswith('.xlsx') or filename.endswith('.xls') or filename.endswith('.csv')):
+                continue
+            clean_name = os.path.splitext(filename)[0]
+            years_covered: list[int] = []
+            if '-' in clean_name:
+                parts = clean_name.split('-')
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    years_covered = list(range(int(parts[0]), int(parts[1]) + 1))
+            elif clean_name.isdigit():
+                years_covered = [int(clean_name)]
+            if not years_covered:
+                continue
+
+            file_path = os.path.join(publindex_dir, filename)
+            try:
+                df = pd.read_csv(file_path) if file_path.endswith('.csv') else pd.read_excel(file_path)
+            except Exception:
+                continue
+            df.columns = [str(c).strip().lower() for c in df.columns]
+            issn_col = next((col for col in df.columns if 'issn' in str(col)), None)
+            if not issn_col:
+                continue
+
+            for _, row in df.iterrows():
+                raw_issns = str(row.get(issn_col, ''))
+                for part in re.split(r'[;,]', raw_issns):
+                    clean_part = self.clean_issn(part)
+                    if clean_part:
+                        if clean_part not in issn_years:
+                            issn_years[clean_part] = set()
+                        issn_years[clean_part].update(years_covered)
+
+        updated = 0
+        for art in null_year_articles:
+            clean_issn = self.clean_issn(art['issn'])
+            if clean_issn and clean_issn in issn_years:
+                earliest_year = min(issn_years[clean_issn])
+                Article.objects.filter(id=art['id']).update(year=earliest_year)
+                updated += 1
+
+        if updated:
+            self.stdout.write(
+                f"  -> Assigned year to {updated} articles with year=None "
+                f"from Publindex earliest occurrence."
+            )
+        else:
+            self.stdout.write(
+                "  -> No year=None articles could be matched to Publindex ISSNs."
+            )
 
     def clean_issn(self, text):
         if not text:
             return ""
         return re.sub(r'\D', '', str(text))
+
+    def _detect_min_year(self, directory_path):
+        """Determine the earliest year covered by dataset files in the directory."""
+        if not os.path.exists(directory_path):
+            return 2020  # fallback
+        years = []
+        for f in os.listdir(directory_path):
+            name = os.path.splitext(f)[0]
+            if '-' in name:
+                parts = name.split('-')
+                if len(parts) == 2 and parts[0].isdigit():
+                    years.append(int(parts[0]))
+            elif name.isdigit():
+                years.append(int(name))
+        return min(years) if years else 2020
 
     def process_directory(self, directory_path, source, issn_map):
         if not os.path.exists(directory_path):

@@ -63,7 +63,7 @@ class GenericProductParser:
             "Consultorías científico-tecnológicas": "DP",
             "Publicaciones editoriales no especializadas": "DP",
             "Estrategias de Comunicación del Conocimiento": "DP",
-            "Espacios de Participación Ciudadana": "PASC"
+            "Espacios de Participación Ciudadana": "DP"
         }
 
     def _clean_text(self, text):
@@ -79,22 +79,53 @@ class GenericProductParser:
     def _extract_year_month(self, text, full_text):
         year = None
         month = ""
-        m_date = re.search(r'\b(20\d{2}|19\d{2})[-/](0[1-9]|1[0-2]|[\w]+)[-/](\d{2})\b', text)
-        if m_date:
-            year, month = int(m_date.group(1)), m_date.group(2)
-        else:
-            m_year = re.search(r'\b(19\d{2}|20\d{2})\b', text)
-            if m_year: year = int(m_year.group(1))
 
-            m_month = re.search(r'Mes\w*:\s*([\w]+)', full_text, re.IGNORECASE)
-            if m_month:
-                month = self._clean_text(m_month.group(1))
-            else:
-                months = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
-                for p_month in months:
-                    if p_month.lower() in full_text.lower():
-                        month = p_month
-                        break
+        # 1) Try labeled year fields first (most reliable).
+        m_labeled = re.search(
+            r'(?:A[ñn]o\s*(?:de\s+)?(?:publicaci[oó]n|realizaci[oó]n|ejecuci[oó]n|creaci[oó]n|registro|solicitud)?\s*:?\s*|Fecha\s*:?\s*|Periodo\s*:?\s*)'
+            r'[^\d]*((?:19|20)\d{2})\b',
+            full_text,
+            re.IGNORECASE,
+        )
+        if m_labeled:
+            year = int(m_labeled.group(1))
+
+        # 2) Try "desde" date pattern (common in generic products).
+        if not year:
+            m_desde = re.search(r'desde\s+(?:\w+\s+)?((?:19|20)\d{2})\b', full_text, re.IGNORECASE)
+            if m_desde:
+                year = int(m_desde.group(1))
+
+        # 3) Try structured date pattern YYYY-MM-DD or YYYY/MM/DD.
+        if not year:
+            m_date = re.search(r'\b(20\d{2}|19\d{2})[-/](0[1-9]|1[0-2]|[\w]+)[-/](\d{2})\b', text)
+            if m_date:
+                year, month = int(m_date.group(1)), m_date.group(2)
+
+        # 4) Fallback: search for a year AFTER the first line (skip title).
+        if not year:
+            lines = text.split('\n')
+            text_without_title = '\n'.join(lines[1:]) if len(lines) > 1 else text
+            m_year = re.search(r'\b(19\d{2}|20\d{2})\b', text_without_title)
+            if m_year:
+                year = int(m_year.group(1))
+
+        # 5) Last resort: any year in the full text (may hit title).
+        if not year:
+            m_year = re.search(r'\b(19\d{2}|20\d{2})\b', text)
+            if m_year:
+                year = int(m_year.group(1))
+
+        # Month extraction (unchanged logic).
+        m_month = re.search(r'Mes\w*:\s*([\w]+)', full_text, re.IGNORECASE)
+        if m_month:
+            month = self._clean_text(m_month.group(1))
+        elif not month:
+            months = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
+            for p_month in months:
+                if p_month.lower() in full_text.lower():
+                    month = p_month
+                    break
         return year, month
 
     def _parse_authors(self, text):
@@ -238,35 +269,43 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.WARNING('Iniciando post-proceso secuencial (full)...'))
 
                 # 1) Enrich researcher profile fields from datos.gov.co only.
-                self.stdout.write(self.style.WARNING('1/5 Enriquecimiento base de investigadores (sin CvLAC individual)...'))
+                self.stdout.write(self.style.WARNING('1/7 Enriquecimiento base de investigadores (sin CvLAC individual)...'))
                 call_command('enrich_researchers')
-                self.stdout.write(self.style.SUCCESS('1/5 Enriquecimiento base de investigadores completado.'))
+                self.stdout.write(self.style.SUCCESS('1/7 Enriquecimiento base de investigadores completado.'))
 
                 # 2) Enrich article categories using Publindex datasets only.
-                self.stdout.write(self.style.WARNING('2/5 Enriquecimiento de categorias de articulos...'))
+                self.stdout.write(self.style.WARNING('2/7 Enriquecimiento de categorias de articulos...'))
                 call_command('enrich_articles')
-                self.stdout.write(self.style.SUCCESS('2/5 Enriquecimiento de articulos completado.'))
+                self.stdout.write(self.style.SUCCESS('2/7 Enriquecimiento de articulos completado.'))
 
                 # 3) Remove duplicate articles created during aggregation/scraping.
-                self.stdout.write(self.style.WARNING('3/5 Limpieza de duplicados de articulos...'))
+                self.stdout.write(self.style.WARNING('3/7 Limpieza de duplicados de articulos...'))
                 if is_dry_run:
                     call_command('cleanup_article_duplicates')
                 else:
                     call_command('cleanup_article_duplicates', apply=True)
-                self.stdout.write(self.style.SUCCESS('3/5 Limpieza de articulos completada.'))
+                self.stdout.write(self.style.SUCCESS('3/7 Limpieza de articulos completada.'))
 
                 # 4) Remove duplicate books/chapters created during aggregation/scraping.
-                self.stdout.write(self.style.WARNING('4/5 Limpieza de duplicados de libros y capitulos...'))
+                self.stdout.write(self.style.WARNING('4/7 Limpieza de duplicados de libros y capitulos...'))
                 if is_dry_run:
                     call_command('cleanup_books_chapters_duplicates')
                 else:
                     call_command('cleanup_books_chapters_duplicates', apply=True)
-                self.stdout.write(self.style.SUCCESS('4/5 Limpieza de libros/capitulos completada.'))
+                self.stdout.write(self.style.SUCCESS('4/7 Limpieza de libros/capitulos completada.'))
 
-                # 5) Final verification report for duplicated records.
-                self.stdout.write(self.style.WARNING('5/5 Verificacion final de duplicados...'))
+                # 5) Remove duplicate theses/events created during aggregation/scraping.
+                self.stdout.write(self.style.WARNING('5/7 Limpieza de duplicados de tesis y eventos...'))
+                if is_dry_run:
+                    call_command('cleanup_theses_events_duplicates')
+                else:
+                    call_command('cleanup_theses_events_duplicates', apply=True)
+                self.stdout.write(self.style.SUCCESS('5/7 Limpieza de tesis/eventos completada.'))
+
+                # 6) Final verification report for duplicated records.
+                self.stdout.write(self.style.WARNING('6/7 Verificacion final de duplicados...'))
                 call_command('analyze_duplicates')
-                self.stdout.write(self.style.SUCCESS('5/5 Verificacion final completada.'))
+                self.stdout.write(self.style.SUCCESS('6/7 Verificacion final completada.'))
                 self.stdout.write(self.style.SUCCESS('Post-proceso secuencial finalizado.'))
                 
                 if is_dry_run:
@@ -330,6 +369,21 @@ class ScientiScraper:
             return string.capwords(text.lower())
         except:
             return text.title()
+
+    def _validate_year(self, year_value) -> int | None:
+        """Return year as int if valid (1950..current_year), else None."""
+        if year_value is None:
+            return None
+        try:
+            y = int(year_value)
+        except (ValueError, TypeError):
+            return None
+        from datetime import datetime
+        current_year = datetime.now().year
+        if y < 1950 or y > current_year:
+            self._log(f"     [WARN] Año inválido descartado: {y}")
+            return None
+        return y
 
     def _normalize_key(self, text: str) -> str:
         if not text:
@@ -1181,7 +1235,7 @@ class ScientiScraper:
                     "country": pais_obj,
                     "city": ciudad_obj,
                     "journal": revista_obj,
-                    "year": int(art.get('year')) if art.get('year') and art.get('year').isdigit() else None,
+                    "year": self._validate_year(art.get('year')),
                     "volume": art.get('volume', ''),
                     "issue": art.get('fasciculo', ''),
                     "pages": art.get('paginas', ''),
@@ -1240,7 +1294,7 @@ class ScientiScraper:
                 defaults={
                     "group": grupo_obj,
                     "title": book.get('title', '')[:500],
-                    "year": int(book.get('year')) if book.get('year') and book.get('year').isdigit() else None,
+                    "year": self._validate_year(book.get('year')),
                     "isbn": book.get('isbn', ''),
                     "publisher": editorial_obj,
                     "country": pais_obj,
@@ -1281,7 +1335,7 @@ class ScientiScraper:
                     "group": grupo_obj,
                     "chapter_title": cap.get('chapter_title', '')[:500],
                     "book_title": cap.get('book_title', '')[:500],
-                    "year": int(cap.get('year')) if cap.get('year') and cap.get('year').isdigit() else None,
+                    "year": self._validate_year(cap.get('year')),
                     "isbn": cap.get('isbn', ''),
                     "publisher": editorial_obj,
                     "product_type": product_type_str,
@@ -1335,7 +1389,7 @@ class ScientiScraper:
                     "group": grupo_obj,
                     "title": t.get('title', '')[:500],
                     "period": t.get('period', ''),
-                    "year": int(t.get('year')) if t.get('year') and str(t.get('year')).isdigit() else None,
+                    "year": self._validate_year(t.get('year')),
                     "start_date": t.get('start_date'),
                     "end_date": t.get('end_date'),
                     "guidance_type": t.get('guidance_type', ''),
@@ -1465,7 +1519,7 @@ class ScientiScraper:
                     "category": p_data["category"],
                     "table_name": p_data["table_name"],
                     "title": p_data["title"],
-                    "year": p_data["year"],
+                    "year": self._validate_year(p_data["year"]),
                     "extra_data": p_data["extra_data"]
                 }
             )
@@ -1608,6 +1662,7 @@ class ScientiScraper:
                         doi = found_doi
 
             # 3. Iterative Parsing over lines
+            _first_line_done = False
             for line in text_lines:
                 # Authors
                 if line.startswith("Autores:"):
@@ -1641,20 +1696,23 @@ class ScientiScraper:
                             revista = pre_issn_part
 
                 # Year
-                # Prefer year that appears after ISSN and avoid taking ISSN prefix as year.
-                if not anio:
-                    m_anio_after_issn = re.search(
-                        r'ISSN\s*:\s*[0-9]{4}-[0-9]{3}[0-9X]\s*,?\s*((?:19|20)\d{2})\b',
-                        line,
-                        re.IGNORECASE,
-                    )
-                    if m_anio_after_issn:
-                        anio = m_anio_after_issn.group(1)
-                    else:
-                        # Fallback: avoid matching numbers that are part of patterns like 1909-0528.
-                        m_anio = re.search(r'\b(?:19|20)\d{2}\b(?!-\d)', line)
-                        if m_anio:
-                            anio = m_anio.group(0)
+                # ISSN-anchored year always wins (most reliable) — overrides any year
+                # previously found in a title line (e.g. "Horizon 2021-2030").
+                m_anio_after_issn = re.search(
+                    r'ISSN\s*:\s*[0-9]{4}-[0-9]{3}[0-9X]\s*,?\s*((?:19|20)\d{2})\b',
+                    line,
+                    re.IGNORECASE,
+                )
+                if m_anio_after_issn:
+                    anio = m_anio_after_issn.group(1)
+                elif not anio and _first_line_done:
+                    # Fallback: only on non-title lines to avoid taking years from article titles.
+                    # Avoid matching numbers that are part of patterns like 1909-0528.
+                    m_anio = re.search(r'\b(?:19|20)\d{2}\b(?!-\d)', line)
+                    if m_anio:
+                        anio = m_anio.group(0)
+
+                _first_line_done = True
 
                 # DOI
                 if "DOI:" in line and not doi:
@@ -2317,11 +2375,11 @@ class ScientiScraper:
                 scope = ""
                 participation = ""
                 for l in lines:
-                    if "Ámbito:" in l:
-                         m_s = re.search(r'Ámbito:\s*([^,]+)', l, re.IGNORECASE)
+                    if "mbito:" in l.lower():  # matches Ámbito/ámbito regardless of encoding
+                         m_s = re.search(r'[Áá]mbito:\s*([^,]+)', l, re.IGNORECASE)
                          if m_s: scope = m_s.group(1).strip()
                          
-                         m_p = re.search(r'Tipos de participación:\s*(.+)', l, re.IGNORECASE)
+                         m_p = re.search(r'Tipos de participaci[oó]n:\s*(.+)', l, re.IGNORECASE)
                          if m_p: participation = m_p.group(1).strip()
                 
                 # Institutions

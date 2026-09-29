@@ -533,6 +533,36 @@ def global_search(request):
         .order_by('-year', 'chapter_title')[:per_type_limit]
     )
 
+    theses_qs = (
+        Thesis.objects.select_related('group')
+        .annotate(
+            normalized_title=normalized_text_annotation('title'),
+        )
+        .filter(
+            Q(normalized_title__icontains=query_normalized) |
+            Q(title__icontains=query) |
+            Q(thesis_type__icontains=query) |
+            Q(institution__icontains=query)
+        )
+        .distinct()
+        .order_by('-year', 'title')[:per_type_limit]
+    )
+
+    events_qs = (
+        ScientificEvent.objects.select_related('group')
+        .annotate(
+            normalized_title=normalized_text_annotation('title'),
+        )
+        .filter(
+            Q(normalized_title__icontains=query_normalized) |
+            Q(title__icontains=query) |
+            Q(event_type__icontains=query) |
+            Q(scope__icontains=query)
+        )
+        .distinct()
+        .order_by('title')[:per_type_limit]
+    )
+
     researchers = [
         {
             'id': str(r.id),
@@ -597,12 +627,37 @@ def global_search(request):
         for c in chapters_qs
     ]
 
+    theses = [
+        {
+            'id': str(t.id),
+            'title': t.title,
+            'year': t.year,
+            'thesisType': t.thesis_type,
+            'institution': t.institution,
+            'groupName': t.group.name if t.group else None,
+        }
+        for t in theses_qs
+    ]
+
+    events = [
+        {
+            'id': str(e.id),
+            'title': e.title,
+            'eventType': e.event_type,
+            'scope': e.scope,
+            'groupName': e.group.name if e.group else None,
+        }
+        for e in events_qs
+    ]
+
     # Defensive dedupe for joins with authors and other related records.
     researchers = unique_by_id(researchers)
     groups = unique_by_id(groups)
     articles = unique_by_id(articles)
     books = unique_by_id(books)
     book_chapters = unique_by_id(book_chapters)
+    theses = unique_by_id(theses)
+    events = unique_by_id(events)
 
     return Response(
         {
@@ -613,7 +668,9 @@ def global_search(request):
                 'articles': len(articles),
                 'books': len(books),
                 'bookChapters': len(book_chapters),
-                'all': len(researchers) + len(groups) + len(articles) + len(books) + len(book_chapters),
+                'theses': len(theses),
+                'events': len(events),
+                'all': len(researchers) + len(groups) + len(articles) + len(books) + len(book_chapters) + len(theses) + len(events),
             },
             'results': {
                 'researchers': researchers,
@@ -621,6 +678,8 @@ def global_search(request):
                 'articles': articles,
                 'books': books,
                 'bookChapters': book_chapters,
+                'theses': theses,
+                'events': events,
             },
         }
     )
@@ -1473,7 +1532,7 @@ def _build_group_detail_payload(group):
 
 
 def _build_typologies_payload(from_year=None, to_year=None):
-    articles = list(Article.objects.select_related('group').order_by('-year', 'title'))
+    articles = list(Article.objects.select_related('group', 'country').order_by('-year', 'title'))
     article_ids = [article.id for article in articles]
 
     article_categories_by_id = {}
@@ -1521,6 +1580,7 @@ def _build_typologies_payload(from_year=None, to_year=None):
             'categorySource': resolved_category['source'],
             'doi': article.doi,
             'issn': article.issn,
+            'country': article.country.name if article.country else None,
             'authors': article_authors_by_id.get(article.id, []),
             'detailPath': f'/articulos/{article.id}',
             'group': {
@@ -1532,7 +1592,7 @@ def _build_typologies_payload(from_year=None, to_year=None):
             } if article.group else None,
         })
 
-    books = list(Book.objects.select_related('group').order_by('-year', 'title'))
+    books = list(Book.objects.select_related('group', 'country').order_by('-year', 'title'))
     book_ids = [book.id for book in books]
     book_authors_by_id = {}
     book_authors_qs = BookAuthor.objects.filter(book_id__in=book_ids).values('book_id', 'author_name', 'researcher_id').order_by('order')
@@ -1548,6 +1608,7 @@ def _build_typologies_payload(from_year=None, to_year=None):
             'title': book.title,
             'year': book.year,
             'isbn': book.isbn,
+            'country': book.country.name if book.country else None,
             'authors': book_authors_by_id.get(book.id, []),
             'detailPath': f'/libros/{book.id}',
             'group': {
@@ -1823,10 +1884,9 @@ def export_typologies_excel(request):
     overview_rows = [
         ('Nuevo conocimiento', len(products['articles']) + len(products['books']) + len(products['bookChapters'])),
         ('Formación RH', len(products['theses'])),
-        ('Eventos científicos', len(products.get('events', []))),
         ('DTeI', sum(1 for item in products.get('generic', []) if item.get('category') == 'DTeI')),
         ('PASC', sum(1 for item in products.get('generic', []) if item.get('category') == 'PASC')),
-        ('DP', sum(1 for item in products.get('generic', []) if item.get('category') == 'DP')),
+        ('DP', sum(1 for item in products.get('generic', []) if item.get('category') == 'DP') + len(products.get('events', []))),
     ]
     cover_sheet['D3'] = 'Totales visibles'
     cover_sheet['D3'].font = Font(bold=True, color='184336')
@@ -1860,16 +1920,21 @@ def export_typologies_excel(request):
         ['Nuevo conocimiento', 'Capítulos de libro', len(products['bookChapters']), 'Nuevo conocimiento'],
         ['Formación RH', 'Total tipología', len(products['theses']), 'Formación RH'],
         *[['Formación RH', subtype, total, 'Formación RH'] for subtype, total in count_by_label(products['theses'], lambda item: item.get('thesisType'))],
-        ['Eventos científicos', 'Total tipología', len(products.get('events', [])), 'Eventos científicos'],
-        *[['Eventos científicos', subtype, total, 'Eventos científicos'] for subtype, total in count_by_label(products.get('events', []), lambda item: item.get('eventType'))],
     ]
     for category in ('DTeI', 'PASC', 'DP'):
         category_rows = [item for item in products.get('generic', []) if item.get('category') == category]
-        summary_sheet_rows.append([category, 'Total tipología', len(category_rows), category])
+        events_in_dp = products.get('events', []) if category == 'DP' else []
+        total_count = len(category_rows) + len(events_in_dp)
+        summary_sheet_rows.append([category, 'Total tipología', total_count, category])
         summary_sheet_rows.extend([
             [category, subtype, total, category]
             for subtype, total in count_by_label(category_rows, lambda item: item.get('tableName'), 'Otros productos')
         ])
+        if events_in_dp:
+            summary_sheet_rows.extend([
+                [category, subtype, total, category]
+                for subtype, total in count_by_label(events_in_dp, lambda item: item.get('eventType'))
+            ])
 
     ws_summary = build_table_sheet(
         'Resumen',
@@ -1891,6 +1956,7 @@ def export_typologies_excel(request):
             row.get('year') or 'N/A',
             normalize_export_value(row.get('group', {}).get('code') if row.get('group') else None),
             normalize_export_value(row.get('group', {}).get('name') if row.get('group') else None),
+            normalize_export_value(row.get('country')),
             normalize_export_value(row.get('category'), 'N/R'),
             normalize_export_value(row.get('categorySource'), 'N/R'),
             normalize_export_value(row.get('issn')),
@@ -1904,6 +1970,7 @@ def export_typologies_excel(request):
             row.get('year') or 'N/A',
             normalize_export_value(row.get('group', {}).get('code') if row.get('group') else None),
             normalize_export_value(row.get('group', {}).get('name') if row.get('group') else None),
+            normalize_export_value(row.get('country')),
             'N/A',
             'N/A',
             normalize_export_value(row.get('isbn')),
@@ -1917,6 +1984,7 @@ def export_typologies_excel(request):
             row.get('year') or 'N/A',
             normalize_export_value(row.get('group', {}).get('code') if row.get('group') else None),
             normalize_export_value(row.get('group', {}).get('name') if row.get('group') else None),
+            'N/A',  # chapters don't have a country field
             normalize_export_value(row.get('bookTitle')),
             'N/A',
             normalize_export_value(row.get('isbn')),
@@ -1926,7 +1994,7 @@ def export_typologies_excel(request):
     if new_knowledge_rows:
         build_table_sheet(
             'Nuevo conocimiento',
-            ['Tipo de registro', 'Título del producto', 'Año', 'Código del grupo', 'Grupo', 'Categoría o contenedor', 'Fuente de categoría', 'ISSN / ISBN', 'DOI', 'Autores'],
+            ['Tipo de registro', 'Título del producto', 'Año', 'Código del grupo', 'Grupo', 'País', 'Categoría o contenedor', 'Fuente de categoría', 'ISSN / ISBN', 'DOI', 'Autores'],
             new_knowledge_rows,
         )
 
@@ -1965,7 +2033,7 @@ def export_typologies_excel(request):
     ]
     if event_rows:
         build_table_sheet(
-            'Eventos científicos',
+            'DP - Eventos',
             ['Evento', 'Fecha inicial', 'Fecha final', 'Clase de evento', 'Ámbito', 'Participación', 'Código del grupo', 'Grupo', 'Instituciones asociadas'],
             event_rows,
         )
@@ -2298,10 +2366,9 @@ def export_group_detail_excel(request, group_id):
         ('Investigadores inactivos', sum(1 for researcher in data['researchers'] if researcher.get('status') == 'INACTIVE')),
         ('Nuevo conocimiento', len(data['products']['articles']) + len(data['products']['books']) + len(data['products']['bookChapters'])),
         ('Formación de recurso humano', len(data['products']['theses'])),
-        ('Eventos científicos', len(data['products'].get('events', []))),
         ('DTeI', sum(1 for product in data['products'].get('generic', []) if product.get('category') == 'DTeI')),
         ('PASC', sum(1 for product in data['products'].get('generic', []) if product.get('category') == 'PASC')),
-        ('DP', sum(1 for product in data['products'].get('generic', []) if product.get('category') == 'DP')),
+        ('DP', sum(1 for product in data['products'].get('generic', []) if product.get('category') == 'DP') + len(data['products'].get('events', []))),
     ]
 
     cover_sheet['D3'] = 'Resumen exportado'
@@ -2349,19 +2416,20 @@ def export_group_detail_excel(request, group_id):
         ['Formación RH', subtype, total, 'Formación RH']
         for subtype, total in count_by_label(data['products']['theses'], lambda item: item.get('thesisType'))
     ])
-    summary_sheet_rows.append(['Eventos científicos', 'Total tipología', len(data['products'].get('events', [])), 'Eventos científicos'])
-    summary_sheet_rows.extend([
-        ['Eventos científicos', subtype, total, 'Eventos científicos']
-        for subtype, total in count_by_label(data['products'].get('events', []), lambda item: item.get('eventType'))
-    ])
-
     for category in ('DTeI', 'PASC', 'DP'):
         category_rows = [row for row in data['products'].get('generic', []) if row.get('category') == category]
-        summary_sheet_rows.append([category, 'Total tipología', len(category_rows), category])
+        events_in_dp = data['products'].get('events', []) if category == 'DP' else []
+        total_count = len(category_rows) + len(events_in_dp)
+        summary_sheet_rows.append([category, 'Total tipología', total_count, category])
         summary_sheet_rows.extend([
             [category, subtype, total, category]
             for subtype, total in count_by_label(category_rows, lambda item: item.get('tableName'), 'Otros productos')
         ])
+        if events_in_dp:
+            summary_sheet_rows.extend([
+                [category, subtype, total, category]
+                for subtype, total in count_by_label(events_in_dp, lambda item: item.get('eventType'))
+            ])
 
     ws_summary = build_table_sheet(
         'Resumen',
@@ -2476,7 +2544,7 @@ def export_group_detail_excel(request, group_id):
     ]
     if event_rows:
         build_table_sheet(
-            'Eventos científicos',
+            'DP - Eventos',
             ['Evento', 'Fecha inicial', 'Fecha final', 'Clase de evento', 'Ámbito', 'Tipo de participación', 'Ciudad', 'País', 'Instituciones asociadas'],
             event_rows,
         )
