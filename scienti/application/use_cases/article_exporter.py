@@ -4,7 +4,7 @@ from typing import Iterable
 
 from django.db.models import QuerySet
 
-from .csv_io import write_csv
+from scienti.infrastructure.files.csv_io import write_csv
 
 
 def export_articles_queryset(queryset: QuerySet, filename: str) -> None:
@@ -23,10 +23,7 @@ def export_articles_queryset(queryset: QuerySet, filename: str) -> None:
     write_csv(filename, headers, iter_rows())
 
 
-def main() -> None:
-    from .django_setup import setup_django
-
-    setup_django()
+def export_data_csv() -> None:
     from scienti.models import Article
 
     all_articles = Article.objects.all().order_by("year")
@@ -39,7 +36,3 @@ def main() -> None:
     future = Article.objects.filter(year__gt=2026)
     if future.exists():
         export_articles_queryset(future, "export_articles_future_err.csv")
-
-
-if __name__ == "__main__":
-    main()

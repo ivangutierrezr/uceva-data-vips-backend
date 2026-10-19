@@ -406,3 +406,44 @@ class ArticleCategory(AuditableModel):
         db_table = "scienti_article_category"
 
 
+# --- GENERIC PRODUCTS (DTeI, PASC, DP) ---
+
+class GenericProduct(AuditableModel):
+    """
+    Modelo comodín estructurado para albergar cualquier producto de:
+    - Desarrollo Tecnológico e Innovación (DTeI)
+    - Procesos de Apropiación Social (PASC)
+    - Divulgación Pública (DP)
+    """
+    hash_id = models.CharField(max_length=50, unique=True) # GEN-HASH
+    group = models.ForeignKey(ResearchGroup, on_delete=models.CASCADE, related_name='generic_products')
+    
+    # Clasificación principal
+    category = models.CharField(max_length=150) # Ej: "DTeI", "PASC", "DP"
+    table_name = models.CharField(max_length=255) # Ej: "Diseños industriales", "Softwares"
+    
+    # Datos base comunes
+    title = models.TextField()
+    year = models.IntegerField(null=True, blank=True)
+    
+    # Datos flexibles extraídos de las columnas dinámicas
+    extra_data = models.JSONField(default=dict, blank=True)
+    
+    def __str__(self):
+        return f"[{self.category}] {self.title[:50]}"
+        
+    class Meta:
+        db_table = "scienti_generic_product"
+
+class GenericProductAuthor(AuditableModel):
+    product = models.ForeignKey(GenericProduct, on_delete=models.CASCADE, related_name='authors')
+    name = models.CharField(max_length=255)
+    role = models.CharField(max_length=255, blank=True, null=True)
+
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        db_table = "scienti_generic_product_author"
+
+

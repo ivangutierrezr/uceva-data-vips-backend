@@ -1,5 +1,6 @@
 from django.core.management.base import BaseCommand
 from django.db import transaction
+from django.utils import timezone
 from scienti.models import (
     ResearchGroup, Researcher, GroupMember,
     Article, Book, BookChapter, Thesis,
@@ -8,7 +9,8 @@ from scienti.models import (
     ScientificEvent, EventInstitution,
     Institution, ProductType, AcademicProgram,
     Country, Department, City, Journal, Publisher,
-    ResearchLine, KnowledgeArea, NationalProgram
+    ResearchLine, KnowledgeArea, NationalProgram,
+    GenericProduct, GenericProductAuthor
 )
 import requests
 from bs4 import BeautifulSoup
@@ -17,21 +19,319 @@ import re
 import hashlib
 import unicodedata
 import time
+from difflib import SequenceMatcher
+
+class GenericProductParser:
+    def __init__(self):
+        self.TABLE_CATEGORIES = {
+            "Softwares": "DTeI",
+            "Diseños industriales": "DTeI",
+            "Nuevos registros científicos": "DTeI",
+            "Innovaciones generadas en la Gestión Empresarial": "DTeI",
+            "Innovaciones en Procesos y Procedimientos": "DTeI",
+            "Regulaciones y Normas": "DTeI",
+            "Conceptos técnicos": "DTeI",
+            "Guías de práctica clínica": "DTeI",
+            "Manuales y modelos de atención diferencial a víctimas": "DTeI",
+            "Protocolos de atención a usuarios/víctimas": "DTeI",
+            "Protocolos de vigilancia epidemiológica": "DTeI",
+            "Empresas de base tecnológica": "DTeI",
+            "Nuevas variedades vegetal / animal / genético": "DTeI",
+            "Procesos de apropiación social del Conocimiento para el fortalecimiento o solución de asuntos de interés social": "PASC",
+            "Productos de apropiación social del conocimiento resultado del trabajo conjunto entre un Centro de Ciencia y un grupo de investigación": "PASC",
+            "Proceso de Apropiación Social del Conocimiento para la generación de insumos de política pública y normatividad": "PASC",
+            "Proceso de apropiación social del Conocimiento para el fortalecimiento de cadenas productivas": "PASC",
+            "Generación de Contenido Impreso": "DP",
+            "Generación de Contenido Multimedia": "DP",
+            "Generación de Contenido Virtual": "DP",
+            "Generaciónes de contenido de audio": "DP",
+            "Producciones de contenido digital - Audiovisual": "DP",
+            "Producciones de contenido digital - Sonoro": "DP",
+            "Producciones de contenido digital - Recursos gráficos": "DP",
+            "Producción de estrategias y contenidos Transmedia": "DP",
+            "Desarrollo Web": "DP",
+            "Desarrollos Web": "DP",
+            "Boletines divulgativos de resultado de investigación": "DP",
+            "Otra publicación divulgativa": "DP",
+            "Libros de Divulgación de investigación y/o Compilación de Divulgación": "DP",
+            "Manuales y Guías Especializadas": "DP",
+            "Producción en arte, arquitectura y diseño": "DP",
+            "Otros Libros publicados": "DP",
+            "Talleres de Creación": "DP",
+            "Documentos de trabajo": "DP",
+            "Informes técnicos": "DP",
+            "Consultorías científico-tecnológicas": "DP",
+            "Publicaciones editoriales no especializadas": "DP",
+            "Estrategias de Comunicación del Conocimiento": "DP",
+            "Espacios de Participación Ciudadana": "DP"
+        }
+
+    def _clean_text(self, text):
+        if not text:
+            return ""
+        text = str(text)
+        if text.strip().lower() == "null":
+            return ""
+        text = re.sub(r'\,{2,}', '', text)
+        text = re.sub(r'^\s*\d+[\.\-]*\s*', '', text)
+        return " ".join(text.split())
+
+    def _extract_year_month(self, text, full_text):
+        year = None
+        month = ""
+
+        # 1) Try labeled year fields first (most reliable).
+        m_labeled = re.search(
+            r'(?:A[ñn]o\s*(?:de\s+)?(?:publicaci[oó]n|realizaci[oó]n|ejecuci[oó]n|creaci[oó]n|registro|solicitud)?\s*:?\s*|Fecha\s*:?\s*|Periodo\s*:?\s*)'
+            r'[^\d]*((?:19|20)\d{2})\b',
+            full_text,
+            re.IGNORECASE,
+        )
+        if m_labeled:
+            year = int(m_labeled.group(1))
+
+        # 2) Try "desde" date pattern (common in generic products).
+        if not year:
+            m_desde = re.search(r'desde\s+(?:\w+\s+)?((?:19|20)\d{2})\b', full_text, re.IGNORECASE)
+            if m_desde:
+                year = int(m_desde.group(1))
+
+        # 3) Try structured date pattern YYYY-MM-DD or YYYY/MM/DD.
+        if not year:
+            m_date = re.search(r'\b(20\d{2}|19\d{2})[-/](0[1-9]|1[0-2]|[\w]+)[-/](\d{2})\b', text)
+            if m_date:
+                year, month = int(m_date.group(1)), m_date.group(2)
+
+        # 4) Fallback: search for a year AFTER the first line (skip title).
+        if not year:
+            lines = text.split('\n')
+            text_without_title = '\n'.join(lines[1:]) if len(lines) > 1 else text
+            m_year = re.search(r'\b(19\d{2}|20\d{2})\b', text_without_title)
+            if m_year:
+                year = int(m_year.group(1))
+
+        # 5) Last resort: any year in the full text (may hit title).
+        if not year:
+            m_year = re.search(r'\b(19\d{2}|20\d{2})\b', text)
+            if m_year:
+                year = int(m_year.group(1))
+
+        # Month extraction (unchanged logic).
+        m_month = re.search(r'Mes\w*:\s*([\w]+)', full_text, re.IGNORECASE)
+        if m_month:
+            month = self._clean_text(m_month.group(1))
+        elif not month:
+            months = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
+            for p_month in months:
+                if p_month.lower() in full_text.lower():
+                    month = p_month
+                    break
+        return year, month
+
+    def _parse_authors(self, text):
+        m = re.search(r'Autores?[\s:]+(.*)', text, re.IGNORECASE)
+        if m:
+            authors_str = self._clean_text(m.group(1))
+            return [a.strip() for a in authors_str.split(',') if a.strip()]
+        return []
+
+    def _extract_kv(self, raw_html, key, fallback=None):
+        pattern = rf'(?:{key})\s*:\s*(.*?)(?:,|<br|\n|$)'
+        m = re.search(pattern, raw_html, re.IGNORECASE)
+        if m:
+            val = self._clean_text(re.sub(r'<[^>]+>', '', m.group(1)))
+            return val if val.lower() != 'null' else ""
+        return fallback or ""
+
+    def parse_cell(self, table_name, raw_html):
+        soup = BeautifulSoup(raw_html, "html.parser")
+        text_content = soup.get_text(separator="\n")
+        full_text_flat = " ".join(text_content.split())
+        
+        parsed = {
+            "table_name": table_name,
+            "category": self.TABLE_CATEGORIES.get(table_name, "OTRO"),
+            "extra_data": {"raw_text": full_text_flat}
+        }
+        
+        parsed["title"] = ""
+        parsed["year"] = None
+        parsed["authors"] = []
+
+        strong_tag = soup.find('strong')
+        if strong_tag:
+            raw_strong = self._clean_text(strong_tag.get_text())
+            
+            if table_name in ["Espacios de Participación Ciudadana", "Estrategias de Comunicación del Conocimiento", "Procesos de apropiación social del Conocimiento para el fortalecimiento o solución de asuntos de interés social", "Talleres de Creación"]:
+                parsed["title"] = self._clean_text(raw_strong)
+                parsed["extra_data"]["tipo"] = table_name
+
+                m_tit = re.search(r'</strong>\s*:?\s*(.*?)(?:<br|\n|,)', raw_html, re.IGNORECASE)
+                if m_tit and len(self._clean_text(re.sub(r'<[^>]+>', '', m_tit.group(1)))) > 5:
+                    parsed["title"] = f"{parsed['title']} {self._clean_text(re.sub(r'<[^>]+>', '', m_tit.group(1)))}".strip()
+                
+                if "Nombre del" in raw_strong:
+                    m_tit = re.search(r'Nombre del (?:proceso|taller)\s*:?\s*(.*?)(?:<br|\n|,)', raw_html, re.IGNORECASE)
+                    if m_tit:
+                        parsed["title"] = self._clean_text(re.sub(r'<[^>]+>', '', m_tit.group(1)))
+            else:
+                parsed["extra_data"]["tipo"] = re.sub(r'^\d+[\.\-]*\s*', '', raw_strong)
+                m_tit = re.search(r'</strong>\s*:?\s*(.*?)(?:<br|\n)', raw_html, re.IGNORECASE)
+                if m_tit:
+                    parsed["title"] = self._clean_text(re.sub(r'<[^>]+>', '', m_tit.group(1)))
+                else: 
+                     sibling = strong_tag.next_sibling
+                     if sibling and isinstance(sibling, str):
+                         parsed["title"] = self._clean_text(sibling.replace(':', ''))
+        else:
+            lines = [l.strip() for l in text_content.split('\n') if l.strip()]
+            if lines:
+                parsed["title"] = self._clean_text(lines[0])
+                parsed["extra_data"]["tipo"] = table_name
+
+        parsed["title"] = self._clean_text(parsed["title"])
+
+        yr, mo = self._extract_year_month(text_content, full_text_flat)
+        parsed["year"] = yr
+        if mo: parsed["extra_data"]["mes"] = mo
+        parsed["authors"] = self._parse_authors(text_content)
+        
+        known_keys = [
+            ("disponibilidad", "Disponibilidad"), ("sitioWeb", r"Sitio web|Sitio web \(URL\)|URL"),
+            ("nombreComercial", "Nombre comercial"), ("nombreProyecto", "Nombre del proyecto"),
+            ("institucionFinanciadora", "Institución financiadora"), ("institucionSolicitante", "Institución solicitante"),
+            ("ambito", "Ambito|Ámbito"), ("objeto", "Objeto"), ("fechaEnvio", "Fecha de envío"),
+            ("ciudad", "Ciudad|Lugar de realización"), ("numeroConsecutivoConcepto", "Número consecutivo del concepto"),
+            ("nit", "NIT"), ("fechaRegistro", "Fecha de registro ante cámara"), ("medioVerificacion", "medio de verificación"),
+            ("tipoLicencia", "Licencia Creative Commons u Open Data Commons del contenido"),
+            ("tipoFormato", "Tipo de formato"), ("medioCirculacion", "Medio de circulación"),
+            ("lugarPublicacion", "Lugar de publicación"), ("idioma", "idioma"),
+            ("medioDivulgacion", "Medio de divulgación"), ("emisora", "Emisora"),
+            ("institucionesParticipanes", "Instituciones participantes|Entidades vinculadas"),
+            ("tipoTaller", "Tipo de taller"), ("participacion", "Participación"),
+            ("fechaInicio", "Fecha de inicio"), ("fechaFinalizacion", "Fecha de finalización"),
+            ("distincionObtenida", "Distinción obtenida"), ("mecanismoSeleccion", "Mecanismo de selección"),
+            ("paginas", r"Nro\. Paginas|Número de páginas|págs|págs\.|Nro\. Páginas"),
+            ("doi", "DOI"), ("baseDatos", "Base de datos donde está incluido el registro"),
+            ("institucionCertificadora", "Institución certificadora"), ("numeroContrato", "Número del contrato"),
+            ("institucionServicio", "Institución en la cual prestó el servicio"), ("duracion", "Duración|Duracion"),
+            ("publicoObjetivo", "público objetivo"), ("generoLiterario", "Género literario"),
+            ("tipoProduccion", "Tipo"), ("tipoCirculacion", "Tipo de circulación"), ("enfoqueDiferencial", "Enfoque diferencial"),
+            ("componenteDigital", "Componente digital"), ("ISBN", "ISBN"), ("volumen", "vol|Volumen"),
+            ("numeroParticipantes", "Número de participantes")
+        ]
+
+        for obj_key, regex_key in known_keys:
+            val = self._extract_kv(raw_html, regex_key)
+            if val:
+                parsed["extra_data"][obj_key] = val
+
+        m_pais = re.search(r'(Colombia|España|Venezuela|México|Mexico|Argentina|Chile|Per[uú]|Ecuador|Brasil|Estados Unidos|USA)\b', full_text_flat, re.IGNORECASE)
+        if m_pais and "pais" not in parsed["extra_data"]:
+            parsed["extra_data"]["pais"] = self._clean_text(m_pais.group(1))
+
+        return parsed
 
 class Command(BaseCommand):
     help = 'Sincroniza los datos de grupos de investigación desde Scienti (Minciencias)'
 
-    def handle(self, *args, **options):
-        self.stdout.write(self.style.SUCCESS('Iniciando proceso de sincronización con Scienti...'))
-        scraper = ScientiScraper(self.stdout, self.style)
-        scraper.run()
-        self.stdout.write(self.style.SUCCESS('Sincronización de grupos completada.'))
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--dry-run',
+            action='store_true',
+            help='Ejecuta todo el proceso de extraccion simulando la insercion para reportar cuantas filas se crearian, pero revierte todo al final (no guarda en base de datos).',
+        )
 
-        # Call Enrich Researchers Command
+    def handle(self, *args, **options):
+        from django.apps import apps
         from django.core.management import call_command
-        self.stdout.write(self.style.WARNING('Iniciando enriquecimiento de investigadores...'))
-        call_command('enrich_researchers')
-        self.stdout.write(self.style.SUCCESS('Enriquecimiento completado exitosamente.'))
+        from django.db import transaction
+        
+        is_dry_run = options.get('dry_run')
+        app_models = apps.get_app_config('scienti').get_models()
+        
+        initial_counts = {}
+        if is_dry_run:
+            self.stdout.write(self.style.WARNING("=================================================="))
+            self.stdout.write(self.style.WARNING("====== MODO DRY RUN ACTIVO (SIMULACION) ========"))
+            self.stdout.write(self.style.WARNING("=================================================="))
+            self.stdout.write(self.style.NOTICE("Calculando estado base de las tablas..."))
+            for model in app_models:
+                initial_counts[model.__name__] = model.objects.count()
+        
+        try:
+            with transaction.atomic():
+                self.stdout.write(self.style.SUCCESS('Iniciando proceso de sincronizacion con Scienti...'))
+                scraper = ScientiScraper(self.stdout, self.style)
+                scraper.run()
+                self.stdout.write(self.style.SUCCESS('Sincronizacion de grupos completada.'))
+
+                self.stdout.write(self.style.WARNING('Iniciando post-proceso secuencial (full)...'))
+
+                # 1) Enrich researcher profile fields from datos.gov.co only.
+                self.stdout.write(self.style.WARNING('1/7 Enriquecimiento base de investigadores (sin CvLAC individual)...'))
+                call_command('enrich_researchers')
+                self.stdout.write(self.style.SUCCESS('1/7 Enriquecimiento base de investigadores completado.'))
+
+                # 2) Enrich article categories using Publindex datasets only.
+                self.stdout.write(self.style.WARNING('2/7 Enriquecimiento de categorias de articulos...'))
+                call_command('enrich_articles')
+                self.stdout.write(self.style.SUCCESS('2/7 Enriquecimiento de articulos completado.'))
+
+                # 3) Remove duplicate articles created during aggregation/scraping.
+                self.stdout.write(self.style.WARNING('3/7 Limpieza de duplicados de articulos...'))
+                if is_dry_run:
+                    call_command('cleanup_article_duplicates')
+                else:
+                    call_command('cleanup_article_duplicates', apply=True)
+                self.stdout.write(self.style.SUCCESS('3/7 Limpieza de articulos completada.'))
+
+                # 4) Remove duplicate books/chapters created during aggregation/scraping.
+                self.stdout.write(self.style.WARNING('4/7 Limpieza de duplicados de libros y capitulos...'))
+                if is_dry_run:
+                    call_command('cleanup_books_chapters_duplicates')
+                else:
+                    call_command('cleanup_books_chapters_duplicates', apply=True)
+                self.stdout.write(self.style.SUCCESS('4/7 Limpieza de libros/capitulos completada.'))
+
+                # 5) Remove duplicate theses/events created during aggregation/scraping.
+                self.stdout.write(self.style.WARNING('5/7 Limpieza de duplicados de tesis y eventos...'))
+                if is_dry_run:
+                    call_command('cleanup_theses_events_duplicates')
+                else:
+                    call_command('cleanup_theses_events_duplicates', apply=True)
+                self.stdout.write(self.style.SUCCESS('5/7 Limpieza de tesis/eventos completada.'))
+
+                # 6) Final verification report for duplicated records.
+                self.stdout.write(self.style.WARNING('6/7 Verificacion final de duplicados...'))
+                call_command('analyze_duplicates')
+                self.stdout.write(self.style.SUCCESS('6/7 Verificacion final completada.'))
+                self.stdout.write(self.style.SUCCESS('Post-proceso secuencial finalizado.'))
+                
+                if is_dry_run:
+                    self.stdout.write(self.style.WARNING("\n================ REPORTE DE VOLUMEN (DRY-RUN) ================"))
+
+                    changes_found = False
+                    for model in app_models:
+                        final_count = model.objects.count()
+                        initial = initial_counts[model.__name__]
+                        diff = final_count - initial
+                        if diff > 0:
+                            self.stdout.write(self.style.SUCCESS(f"{model.__name__:<25} | Antes: {initial:<8} | Despues: {final_count:<8} | Insertados (Diff): +{diff:<8}"))
+                            changes_found = True
+                    
+                    if not changes_found:
+                        self.stdout.write(self.style.NOTICE("Ninguna tabla recibiria registros nuevos."))
+                    
+                    self.stdout.write(self.style.WARNING("=============================================================="))
+                    
+                    self.stdout.write(self.style.ERROR("REVIRTIENDO TRANSACCION PARA NO MODIFICAR BD..."))
+                    transaction.set_rollback(True)
+                    self.stdout.write(self.style.SUCCESS("Rollback completado. La base de datos sigue intacta."))
+                    
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f"Error durante el proceso: {e}"))
+            raise e
 
 class ScientiScraper:
     BASE_URL = "https://scienti.minciencias.gov.co/ciencia-war/busquedaGrupoXInstitucionGrupos.do"
@@ -44,7 +344,7 @@ class ScientiScraper:
     # --- DEBUG SETTINGS ---
     # Set to True to limit the number of processed items for testing
     DEBUG_MODE = False
-    MAX_DEBUG_ITEMS = 15
+    MAX_DEBUG_ITEMS = 5
     # ----------------------
 
     def __init__(self, stdout, style):
@@ -70,6 +370,21 @@ class ScientiScraper:
         except:
             return text.title()
 
+    def _validate_year(self, year_value) -> int | None:
+        """Return year as int if valid (1950..current_year), else None."""
+        if year_value is None:
+            return None
+        try:
+            y = int(year_value)
+        except (ValueError, TypeError):
+            return None
+        from datetime import datetime
+        current_year = datetime.now().year
+        if y < 1950 or y > current_year:
+            self._log(f"     [WARN] Año inválido descartado: {y}")
+            return None
+        return y
+
     def _normalize_key(self, text: str) -> str:
         if not text:
             return ""
@@ -78,6 +393,154 @@ class ScientiScraper:
         cleaned_text = cleaned_text.upper().strip()
         cleaned_text = re.sub(r'[^A-Z0-9]', '', cleaned_text)
         return cleaned_text
+
+    def _normalize_text_for_similarity(self, text: str) -> str:
+        if not text:
+            return ""
+        normalized = unicodedata.normalize('NFD', text)
+        no_accents = ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')
+        lowered = no_accents.lower()
+        lowered = re.sub(r'[^a-z0-9\s]', ' ', lowered)
+        lowered = re.sub(r'\s+', ' ', lowered).strip()
+        return lowered
+
+    def _similarity_ratio(self, a: str, b: str) -> float:
+        na = self._normalize_text_for_similarity(a)
+        nb = self._normalize_text_for_similarity(b)
+        if not na or not nb:
+            return 0.0
+        return SequenceMatcher(None, na, nb).ratio()
+
+    def _pick_better_book_record(self, current: dict, candidate: dict) -> dict:
+        def to_year(value):
+            try:
+                return int(value)
+            except Exception:
+                return 0
+
+        cy = to_year(current.get('year'))
+        ny = to_year(candidate.get('year'))
+        if ny > cy:
+            return candidate
+        if cy > ny:
+            return current
+
+        current_title_len = len(self._normalize_text_for_similarity(current.get('title', '')))
+        candidate_title_len = len(self._normalize_text_for_similarity(candidate.get('title', '')))
+        if candidate_title_len > current_title_len:
+            return candidate
+        if current_title_len > candidate_title_len:
+            return current
+
+        current_score = 0
+        candidate_score = 0
+        for field in ['isbn', 'publisher', 'country']:
+            if current.get(field):
+                current_score += 1
+            if candidate.get(field):
+                candidate_score += 1
+        current_score += len(current.get('autores', []))
+        candidate_score += len(candidate.get('autores', []))
+
+        if candidate_score > current_score:
+            return candidate
+        return current
+
+    def _pick_better_chapter_record(self, current: dict, candidate: dict) -> dict:
+        def to_year(value):
+            try:
+                return int(value)
+            except Exception:
+                return 0
+
+        cy = to_year(current.get('year'))
+        ny = to_year(candidate.get('year'))
+        if ny > cy:
+            return candidate
+        if cy > ny:
+            return current
+
+        current_len = len(self._normalize_text_for_similarity(current.get('chapter_title', ''))) + len(self._normalize_text_for_similarity(current.get('book_title', '')))
+        candidate_len = len(self._normalize_text_for_similarity(candidate.get('chapter_title', ''))) + len(self._normalize_text_for_similarity(candidate.get('book_title', '')))
+        if candidate_len > current_len:
+            return candidate
+        if current_len > candidate_len:
+            return current
+
+        current_score = 0
+        candidate_score = 0
+        for field in ['isbn', 'publisher']:
+            if current.get(field):
+                current_score += 1
+            if candidate.get(field):
+                candidate_score += 1
+        current_score += len(current.get('autores', []))
+        candidate_score += len(candidate.get('autores', []))
+
+        if candidate_score > current_score:
+            return candidate
+        return current
+
+    def _merge_authors(self, base: dict, incoming: dict):
+        base_authors = list(base.get('autores', []))
+        for name in incoming.get('autores', []):
+            if name not in base_authors:
+                base_authors.append(name)
+        base['autores'] = base_authors
+
+    def _dedupe_books_rows(self, books: list[dict]) -> list[dict]:
+        survivors = []
+        for candidate in books:
+            duplicate_index = None
+            for idx, current in enumerate(survivors):
+                same_isbn = bool(candidate.get('isbn')) and bool(current.get('isbn')) and self._normalize_key(candidate.get('isbn')) == self._normalize_key(current.get('isbn'))
+                title_similarity = self._similarity_ratio(candidate.get('title', ''), current.get('title', ''))
+                same_country = self._normalize_key(candidate.get('country', '')) == self._normalize_key(current.get('country', ''))
+
+                if same_isbn or (title_similarity >= 0.95 and same_country):
+                    duplicate_index = idx
+                    break
+
+            if duplicate_index is None:
+                survivors.append(candidate)
+                continue
+
+            current = survivors[duplicate_index]
+            better = self._pick_better_book_record(current, candidate)
+            if better is candidate:
+                self._merge_authors(candidate, current)
+                survivors[duplicate_index] = candidate
+            else:
+                self._merge_authors(current, candidate)
+
+        return survivors
+
+    def _dedupe_chapters_rows(self, chapters: list[dict]) -> list[dict]:
+        survivors = []
+        for candidate in chapters:
+            duplicate_index = None
+            for idx, current in enumerate(survivors):
+                same_isbn = bool(candidate.get('isbn')) and bool(current.get('isbn')) and self._normalize_key(candidate.get('isbn')) == self._normalize_key(current.get('isbn'))
+                chapter_similarity = self._similarity_ratio(candidate.get('chapter_title', ''), current.get('chapter_title', ''))
+                book_similarity = self._similarity_ratio(candidate.get('book_title', ''), current.get('book_title', ''))
+
+                if same_isbn or (chapter_similarity >= 0.95 and book_similarity >= 0.90):
+                    duplicate_index = idx
+                    break
+
+            if duplicate_index is None:
+                survivors.append(candidate)
+                continue
+
+            current = survivors[duplicate_index]
+            better = self._pick_better_chapter_record(current, candidate)
+            if better is candidate:
+                self._merge_authors(candidate, current)
+                survivors[duplicate_index] = candidate
+            else:
+                self._merge_authors(current, candidate)
+
+        return survivors
 
     def _parse_location_string(self, text: str):
         """
@@ -772,7 +1235,7 @@ class ScientiScraper:
                     "country": pais_obj,
                     "city": ciudad_obj,
                     "journal": revista_obj,
-                    "year": int(art.get('year')) if art.get('year') and art.get('year').isdigit() else None,
+                    "year": self._validate_year(art.get('year')),
                     "volume": art.get('volume', ''),
                     "issue": art.get('fasciculo', ''),
                     "pages": art.get('paginas', ''),
@@ -831,7 +1294,7 @@ class ScientiScraper:
                 defaults={
                     "group": grupo_obj,
                     "title": book.get('title', '')[:500],
-                    "year": int(book.get('year')) if book.get('year') and book.get('year').isdigit() else None,
+                    "year": self._validate_year(book.get('year')),
                     "isbn": book.get('isbn', ''),
                     "publisher": editorial_obj,
                     "country": pais_obj,
@@ -872,7 +1335,7 @@ class ScientiScraper:
                     "group": grupo_obj,
                     "chapter_title": cap.get('chapter_title', '')[:500],
                     "book_title": cap.get('book_title', '')[:500],
-                    "year": int(cap.get('year')) if cap.get('year') and cap.get('year').isdigit() else None,
+                    "year": self._validate_year(cap.get('year')),
                     "isbn": cap.get('isbn', ''),
                     "publisher": editorial_obj,
                     "product_type": product_type_str,
@@ -926,7 +1389,7 @@ class ScientiScraper:
                     "group": grupo_obj,
                     "title": t.get('title', '')[:500],
                     "period": t.get('period', ''),
-                    "year": int(t.get('year')) if t.get('year') and str(t.get('year')).isdigit() else None,
+                    "year": self._validate_year(t.get('year')),
                     "start_date": t.get('start_date'),
                     "end_date": t.get('end_date'),
                     "guidance_type": t.get('guidance_type', ''),
@@ -1026,9 +1489,94 @@ class ScientiScraper:
                     relationship_type=inst['relationship']
                 )
 
+
+        # --- NUEVO: Procesamiento de Productos Genéricos (DTeI, PASC, DP) ---
+        self._log("     -> Procesando Productos Genéricos (DTeI, PASC, DP)...")
+        generic_parser = GenericProductParser()
+        generic_data = self._extract_generic_products_from_soup(soup, generic_parser)
+        
+        if self.DEBUG_MODE:
+            self._log(f"        DEBUG: Limitando productos genéricos a {self.MAX_DEBUG_ITEMS}")
+            generic_data = generic_data[:self.MAX_DEBUG_ITEMS]
+
+        for p_data in generic_data:
+            # Build id
+            raw_title = p_data.get("title", "")
+            safe_title = self._normalize_key(raw_title)
+            safe_table = self._normalize_key(p_data.get("table_name", ""))
+            str_year = str(p_data.get("year") or "0")
+            gen_id = f"GEN-{grupo_obj.code}-{safe_table}-{safe_title[:30]}-{str_year}"
+            
+            # Generar hash_id si no cabe
+            import hashlib
+            gen_hash = hashlib.md5(gen_id.encode('utf-8')).hexdigest()[:48]
+
+            # Create or update GenericProduct
+            gen_obj, created = GenericProduct.objects.update_or_create(
+                hash_id=gen_hash,
+                group=grupo_obj,
+                defaults={
+                    "category": p_data["category"],
+                    "table_name": p_data["table_name"],
+                    "title": p_data["title"],
+                    "year": self._validate_year(p_data["year"]),
+                    "extra_data": p_data["extra_data"]
+                }
+            )
+
+            # Authors Custom Loop
+            processed_aut_ids = []
+            for a_name in p_data["authors"]:
+                aut_obj, _ = GenericProductAuthor.objects.update_or_create(
+                    product=gen_obj,
+                    name=a_name,
+                    defaults={"role": "Author"}
+                )
+                processed_aut_ids.append(aut_obj.id)
+            
+            GenericProductAuthor.objects.filter(product=gen_obj).exclude(id__in=processed_aut_ids).delete()
+
     # --- EXTRACTORS ---
+    def _extract_generic_products_from_soup(self, soup, parser_instance):
+        results = []
+        target_headers = []
+        for h in soup.find_all('td', class_='celdaEncabezado'):
+            txt = re.sub(r'\s+', ' ', h.get_text().strip())
+            if txt in parser_instance.TABLE_CATEGORIES:
+                target_headers.append((h, txt))
+
+        for h, table_name in target_headers:
+            parent_tr = h.find_parent('tr')
+            if not parent_tr: continue
+            siblings = parent_tr.find_next_siblings('tr')
+            for sib in siblings:
+                if sib.find('td', class_='celdaEncabezado'): break
+                tds = sib.find_all('td')
+                content_td = None
+                for td in tds:
+                    txt_strip = td.get_text(strip=True)
+                    if re.match(r'^\s*\d+[\.\-]*\s*', txt_strip) or (td.find('strong') and "Nombre" in td.find('strong').get_text()):
+                        content_td = td
+                        break
+                
+                # If there's no strong or enumeration, we just take the first cell if it has classes like celdas0, celdas1, celdas_1
+                if not content_td:
+                    for td in tds:
+                        td_class = td.get('class', [])
+                        if any('celda' in c for c in td_class) and not 'celdaEncabezado' in td_class:
+                            content_td = td
+                            break
+
+                if not content_td: continue
+
+                # Parse the cell content using our generic rules
+                parsed_dict = parser_instance.parse_cell(table_name, str(content_td))
+                results.append(parsed_dict)
+        return results
+
     def _extract_articles_from_soup(self, soup):
         articles = []
+        seen_by_canonical_key = {}
         headers = soup.find_all('td', class_='celdaEncabezado')
         target_header = None
         for h in headers:
@@ -1114,6 +1662,7 @@ class ScientiScraper:
                         doi = found_doi
 
             # 3. Iterative Parsing over lines
+            _first_line_done = False
             for line in text_lines:
                 # Authors
                 if line.startswith("Autores:"):
@@ -1147,12 +1696,23 @@ class ScientiScraper:
                             revista = pre_issn_part
 
                 # Year
-                # Look for 4 digits bounded by word boundaries
-                if not anio:
-                    m_anio = re.search(r'\b(19|20)\d{2}\b', line)
+                # ISSN-anchored year always wins (most reliable) — overrides any year
+                # previously found in a title line (e.g. "Horizon 2021-2030").
+                m_anio_after_issn = re.search(
+                    r'ISSN\s*:\s*[0-9]{4}-[0-9]{3}[0-9X]\s*,?\s*((?:19|20)\d{2})\b',
+                    line,
+                    re.IGNORECASE,
+                )
+                if m_anio_after_issn:
+                    anio = m_anio_after_issn.group(1)
+                elif not anio and _first_line_done:
+                    # Fallback: only on non-title lines to avoid taking years from article titles.
+                    # Avoid matching numbers that are part of patterns like 1909-0528.
+                    m_anio = re.search(r'\b(?:19|20)\d{2}\b(?!-\d)', line)
                     if m_anio:
-                         # Ensure it's not part of ISSN or DOI if possible, but regex \b helps
-                         anio = m_anio.group(0)
+                        anio = m_anio.group(0)
+
+                _first_line_done = True
 
                 # DOI
                 if "DOI:" in line and not doi:
@@ -1185,7 +1745,7 @@ class ScientiScraper:
                     m_pags = re.search(r'(?:p[áa]gs?\.?|pp?\.?)\s*:?\s*([\d\s\-]+)', line, re.IGNORECASE)
                     if m_pags: paginas = m_pags.group(1).strip()
 
-            articles.append({
+            article_row = {
                 "product_type": self._to_title_case(subtipo_producto),
                 "title": self._to_title_case(titulo),
                 "country": self._to_title_case(pais),
@@ -1198,7 +1758,42 @@ class ScientiScraper:
                 "doi": doi,
                 "doi_suffix": sufijo_doi,
                 "autores": autores
-            })
+            }
+
+            # Canonical key to avoid duplicated rows with small metadata noise (e.g., conflicting ISSN).
+            # We intentionally exclude ISSN from the key and preserve the first occurrence in source order.
+            canonical_key = "|".join([
+                self._normalize_key(article_row.get("product_type", "")),
+                self._normalize_key(article_row.get("title", "")),
+                str(article_row.get("year", "") or ""),
+                self._normalize_key(article_row.get("journal", "")),
+                self._normalize_key(article_row.get("country", "")),
+                self._normalize_key(article_row.get("volume", "")),
+                self._normalize_key(article_row.get("fasciculo", "")),
+                self._normalize_key(article_row.get("paginas", "")),
+            ])
+
+            if canonical_key in seen_by_canonical_key:
+                existing = seen_by_canonical_key[canonical_key]
+
+                # Keep first row as canonical; enrich only if canonical is missing data.
+                if not existing.get("issn") and article_row.get("issn"):
+                    existing["issn"] = article_row["issn"]
+                if not existing.get("doi") and article_row.get("doi"):
+                    existing["doi"] = article_row["doi"]
+                    existing["doi_suffix"] = article_row.get("doi_suffix", "")
+
+                if article_row.get("autores"):
+                    merged_authors = list(existing.get("autores", []))
+                    for author_name in article_row["autores"]:
+                        if author_name not in merged_authors:
+                            merged_authors.append(author_name)
+                    existing["autores"] = merged_authors
+                continue
+
+            seen_by_canonical_key[canonical_key] = article_row
+
+        articles = list(seen_by_canonical_key.values())
         return articles
 
     def _extract_books_from_soup(self, soup):
@@ -1330,7 +1925,7 @@ class ScientiScraper:
                     "publisher": self._to_title_case(editorial),
                     "country": self._to_title_case(pais)
                 })
-        return books
+        return self._dedupe_books_rows(books)
 
     def _extract_chapters_from_soup(self, soup):
         chapters = []
@@ -1413,7 +2008,7 @@ class ScientiScraper:
                     "isbn": isbn,
                     "publisher": self._to_title_case(editorial)
                 })
-        return chapters
+        return self._dedupe_chapters_rows(chapters)
 
     def _extract_thesis_from_soup(self, soup):
         theses = []
@@ -1763,24 +2358,28 @@ class ScientiScraper:
                     try:
                          # Usually format YYYY-MM-DD HH:MM:SS.0
                          start_date_clean = start_date_str.split()[0] # Take YYYY-MM-DD
-                         start_date = datetime.datetime.strptime(start_date_clean, "%Y-%m-%d")
+                         start_date = timezone.make_aware(
+                             datetime.datetime.strptime(start_date_clean, "%Y-%m-%d")
+                         )
                     except: pass
                 
                 if end_date_str:
                     try:
                          end_date_clean = end_date_str.split()[0]
-                         end_date = datetime.datetime.strptime(end_date_clean, "%Y-%m-%d")
+                         end_date = timezone.make_aware(
+                             datetime.datetime.strptime(end_date_clean, "%Y-%m-%d")
+                         )
                     except: pass
 
                 # Scope and Participation
                 scope = ""
                 participation = ""
                 for l in lines:
-                    if "Ámbito:" in l:
-                         m_s = re.search(r'Ámbito:\s*([^,]+)', l, re.IGNORECASE)
+                    if "mbito:" in l.lower():  # matches Ámbito/ámbito regardless of encoding
+                         m_s = re.search(r'[Áá]mbito:\s*([^,]+)', l, re.IGNORECASE)
                          if m_s: scope = m_s.group(1).strip()
                          
-                         m_p = re.search(r'Tipos de participación:\s*(.+)', l, re.IGNORECASE)
+                         m_p = re.search(r'Tipos de participaci[oó]n:\s*(.+)', l, re.IGNORECASE)
                          if m_p: participation = m_p.group(1).strip()
                 
                 # Institutions
